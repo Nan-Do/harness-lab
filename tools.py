@@ -29,7 +29,12 @@ def agent_tool(
     risky: bool = False,
     example: str = "",
 ):
-    """Decorator to register a tool function into the global catalog."""
+    """Decorator to register a tool function into the global catalog.
+
+    Tool functions validate their arguments eagerly and return a zero-argument
+    callable that performs the actual work, so the registry can reject
+    malformed calls before asking for approval.
+    """
 
     def decorator(func: Callable):
         _TOOL_CATALOG[name] = {
@@ -54,23 +59,26 @@ def agent_tool(
     schema={"path": "str='.'"},
     example='arguments: {"path": "."}',
 )
-def list_files_tool(args: Dict, registry: "ToolRegistry") -> str:
+def list_files_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
     path = registry._path(args.get("path", "."))
     if not path.is_dir():
         raise ValueError("path is not a directory")
 
-    entries = [
-        item
-        for item in sorted(
-            path.iterdir(), key=lambda item: (item.is_file(), item.name.lower())
-        )
-        if item.name not in IGNORED_PATH_NAMES
-    ]
-    lines = []
-    for entry in entries[:200]:
-        kind = "[D]" if entry.is_dir() else "[F]"
-        lines.append(f"{kind} {entry.relative_to(registry.root)}")
-    return "\n".join(lines) or "(empty)"
+    def execute() -> str:
+        entries = [
+            item
+            for item in sorted(
+                path.iterdir(), key=lambda item: (item.is_file(), item.name.lower())
+            )
+            if item.name not in IGNORED_PATH_NAMES
+        ]
+        lines = []
+        for entry in entries[:200]:
+            kind = "[D]" if entry.is_dir() else "[F]"
+            lines.append(f"{kind} {entry.relative_to(registry.root)}")
+        return "\n".join(lines) or "(empty)"
+
+    return execute
 
 
 @agent_tool(
@@ -79,7 +87,7 @@ def list_files_tool(args: Dict, registry: "ToolRegistry") -> str:
     schema={"path": "str", "start": "int=1", "end": "int=200"},
     example='arguments: {"path": "README.md", "start": 1, "end": 80}',
 )
-def read_file_tool(args: Dict, registry: "ToolRegistry") -> str:
+def read_file_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
     if "path" not in args:
         raise ValueError("missing path")
     path = registry._path(args["path"])
@@ -91,12 +99,15 @@ def read_file_tool(args: Dict, registry: "ToolRegistry") -> str:
     if start < 1 or end < start:
         raise ValueError("invalid line range")
 
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    body = "\n".join(
-        f"{number:>4}: {line}"
-        for number, line in enumerate(lines[start - 1 : end], start=start)
-    )
-    return f"# {path.relative_to(registry.root)}\n{body}"
+    def execute() -> str:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        body = "\n".join(
+            f"{number:>4}: {line}"
+            for number, line in enumerate(lines[start - 1 : end], start=start)
+        )
+        return f"# {path.relative_to(registry.root)}\n{body}"
+
+    return execute
 
 
 @agent_tool(
@@ -105,47 +116,50 @@ def read_file_tool(args: Dict, registry: "ToolRegistry") -> str:
     schema={"pattern": "str", "path": "str='.'"},
     example='arguments: {"pattern": "binary_search", "path": "."}',
 )
-def search_tool(args: Dict, registry: "ToolRegistry") -> str:
+def search_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
     pattern = str(args.get("pattern", "")).strip()
     if not pattern:
         raise ValueError("pattern must not be empty")
     path = registry._path(args.get("path", "."))
 
-    if shutil.which("rg"):
-        result = subprocess.run(
-            ["rg", "-n", "--smart-case", "--max-count", "200", pattern, str(path)],
-            cwd=registry.root,
-            capture_output=True,
-            text=True,
-        )
-        return result.stdout.strip() or result.stderr.strip() or "(no matches)"
-
-    matches = []
-    files = (
-        [path]
-        if path.is_file()
-        else [
-            item
-            for item in path.rglob("*")
-            if item.is_file()
-            and not any(
-                part in IGNORED_PATH_NAMES
-                for part in item.relative_to(registry.root).parts
+    def execute() -> str:
+        if shutil.which("rg"):
+            result = subprocess.run(
+                ["rg", "-n", "--smart-case", "--max-count", "200", pattern, str(path)],
+                cwd=registry.root,
+                capture_output=True,
+                text=True,
             )
-        ]
-    )
-    for file_path in files:
-        for number, line in enumerate(
-            file_path.read_text(encoding="utf-8", errors="replace").splitlines(),
-            start=1,
-        ):
-            if pattern.lower() in line.lower():
-                matches.append(
-                    f"{file_path.relative_to(registry.root)}:{number}:{line}"
+            return result.stdout.strip() or result.stderr.strip() or "(no matches)"
+
+        matches = []
+        files = (
+            [path]
+            if path.is_file()
+            else [
+                item
+                for item in path.rglob("*")
+                if item.is_file()
+                and not any(
+                    part in IGNORED_PATH_NAMES
+                    for part in item.relative_to(registry.root).parts
                 )
-                if len(matches) >= 200:
-                    return "\n".join(matches)
-    return "\n".join(matches) or "(no matches)"
+            ]
+        )
+        for file_path in files:
+            for number, line in enumerate(
+                file_path.read_text(encoding="utf-8", errors="replace").splitlines(),
+                start=1,
+            ):
+                if pattern.lower() in line.lower():
+                    matches.append(
+                        f"{file_path.relative_to(registry.root)}:{number}:{line}"
+                    )
+                    if len(matches) >= 200:
+                        return "\n".join(matches)
+        return "\n".join(matches) or "(no matches)"
+
+    return execute
 
 
 @agent_tool(
@@ -155,7 +169,7 @@ def search_tool(args: Dict, registry: "ToolRegistry") -> str:
     risky=True,
     example='arguments: {"command": "uv run --with pytest python -m pytest -q", "timeout": 20}',
 )
-def run_shell_tool(args: Dict, registry: "ToolRegistry") -> str:
+def run_shell_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
     command = str(args.get("command", "")).strip()
     if not command:
         raise ValueError("command must not be empty")
@@ -163,23 +177,26 @@ def run_shell_tool(args: Dict, registry: "ToolRegistry") -> str:
     if timeout < 1 or timeout > 120:
         raise ValueError("timeout must be in [1, 120]")
 
-    result = subprocess.run(
-        command,
-        cwd=registry.root,
-        shell=True,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    return "\n".join(
-        [
-            f"exit_code: {result.returncode}",
-            "stdout:",
-            result.stdout.strip() or "(empty)",
-            "stderr:",
-            result.stderr.strip() or "(empty)",
-        ]
-    )
+    def execute() -> str:
+        result = subprocess.run(
+            command,
+            cwd=registry.root,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return "\n".join(
+            [
+                f"exit_code: {result.returncode}",
+                "stdout:",
+                result.stdout.strip() or "(empty)",
+                "stderr:",
+                result.stderr.strip() or "(empty)",
+            ]
+        )
+
+    return execute
 
 
 @agent_tool(
@@ -189,7 +206,7 @@ def run_shell_tool(args: Dict, registry: "ToolRegistry") -> str:
     risky=True,
     example='arguments: {"path": "binary_search.py", "content": "def binary_search(nums, target):\\n    return -1\\n"}',
 )
-def write_file_tool(args: Dict, registry: "ToolRegistry") -> str:
+def write_file_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
     if "path" not in args:
         raise ValueError("missing path")
     path = registry._path(args["path"])
@@ -200,9 +217,13 @@ def write_file_tool(args: Dict, registry: "ToolRegistry") -> str:
         raise ValueError("missing content")
 
     content = str(args["content"])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-    return f"wrote {path.relative_to(registry.root)} ({len(content)} chars)"
+
+    def execute() -> str:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return f"wrote {path.relative_to(registry.root)} ({len(content)} chars)"
+
+    return execute
 
 
 @agent_tool(
@@ -212,7 +233,7 @@ def write_file_tool(args: Dict, registry: "ToolRegistry") -> str:
     risky=True,
     example='arguments: {"path": "binary_search.py", "old_text": "return -1", "new_text": "return mid"}',
 )
-def patch_file_tool(args: Dict, registry: "ToolRegistry") -> str:
+def patch_file_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
     if "path" not in args:
         raise ValueError("missing path")
     path = registry._path(args["path"])
@@ -225,14 +246,18 @@ def patch_file_tool(args: Dict, registry: "ToolRegistry") -> str:
         raise ValueError("old_text must not be empty")
     if "new_text" not in args:
         raise ValueError("missing new_text")
+    new_text = str(args["new_text"])
 
     text = path.read_text(encoding="utf-8")
     count = text.count(old_text)
     if count != 1:
         raise ValueError(f"old_text must occur exactly once, found {count}")
 
-    path.write_text(text.replace(old_text, str(args["new_text"]), 1), encoding="utf-8")
-    return f"patched {path.relative_to(registry.root)}"
+    def execute() -> str:
+        path.write_text(text.replace(old_text, new_text, 1), encoding="utf-8")
+        return f"patched {path.relative_to(registry.root)}"
+
+    return execute
 
 
 @agent_tool(
@@ -241,7 +266,7 @@ def patch_file_tool(args: Dict, registry: "ToolRegistry") -> str:
     schema={"task": "str", "max_steps": "int=3"},
     example='arguments: {"task": "inspect README.md", "max_steps": 3}',
 )
-def delegate_tool(args: Dict, registry: "ToolRegistry") -> str:
+def delegate_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
     if registry.delegate_fn is None:
         raise ValueError("delegate function not configured")
 
@@ -250,7 +275,11 @@ def delegate_tool(args: Dict, registry: "ToolRegistry") -> str:
         raise ValueError("task must not be empty")
 
     max_steps = int(args.get("max_steps", 3))
-    return registry.delegate_fn(task, max_steps)
+
+    def execute() -> str:
+        return registry.delegate_fn(task, max_steps)
+
+    return execute
 
 
 # --- Core Tool Registry ---
@@ -341,6 +370,13 @@ class ToolRegistry:
             )
             return f"error: repeated identical tool call for {name}; choose a different tool or return a final answer"
 
+        try:
+            # Validate the arguments first so approval is only requested for
+            # calls that can actually execute.
+            execute = tool.run(args)
+        except Exception as exc:
+            return self._tool_error(name, args, exc)
+
         if tool.risky:
             approved = self._approve(name, args)
             self.logger.log(
@@ -356,22 +392,24 @@ class ToolRegistry:
                 return f"error: approval denied for {name}"
 
         try:
-            # The tool.run callable handles both execution and validation now
-            return clip(tool.run(args))
+            return clip(execute())
         except Exception as exc:
-            self.logger.log(
-                "tool_error",
-                name=name,
-                args=args,
-                error_type=type(exc).__name__,
-                error=str(exc),
-                traceback=traceback.format_exc(),
-            )
-            example = _TOOL_EXAMPLES.get(name, "")
-            message = f"error: tool {name} failed: {exc}"
-            if example:
-                message += f"\nexample: {example}"
-            return message
+            return self._tool_error(name, args, exc)
+
+    def _tool_error(self, name: str, args: Dict, exc: Exception) -> str:
+        self.logger.log(
+            "tool_error",
+            name=name,
+            args=args,
+            error_type=type(exc).__name__,
+            error=str(exc),
+            traceback=traceback.format_exc(),
+        )
+        example = _TOOL_EXAMPLES.get(name, "")
+        message = f"error: tool {name} failed: {exc}"
+        if example:
+            message += f"\nexample: {example}"
+        return message
 
     def _build(self) -> Tools:
         tools = {}
@@ -383,7 +421,7 @@ class ToolRegistry:
 
             # Closure to inject the registry instance into the tool function
             def make_run(f):
-                def run_wrapper(args: Dict) -> str:
+                def run_wrapper(args: Dict) -> Callable[[], str]:
                     args = args or {}
                     return f(args, registry=self)
 
