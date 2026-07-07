@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, TypeAlias, Union
 
 
@@ -45,9 +45,18 @@ class ToolCall:
 
 
 @dataclass
+class MalformedToolCall:
+    id: str
+    name: str
+    raw_args: str
+    error: str
+
+
+@dataclass
 class ModelResponse:
     content: str
     tool_calls: List[ToolCall]
+    malformed_tool_calls: List[MalformedToolCall] = field(default_factory=list)
 
 
 HistoryEntry: TypeAlias = Union[MessageEntry, ToolMessageEntry]

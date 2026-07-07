@@ -309,8 +309,35 @@ class MiniAgent:
                 attempt=attempts,
                 tool_step=tool_steps,
                 tool_calls=[call.name for call in response.tool_calls],
+                malformed_tool_calls=[
+                    {"name": bad.name, "error": bad.error}
+                    for bad in response.malformed_tool_calls
+                ],
                 content=clip(response.content, 2000),
             )
+
+            if response.malformed_tool_calls:
+                for bad in response.malformed_tool_calls:
+                    self.logger.log(
+                        "malformed_tool_call",
+                        attempt=attempts,
+                        name=bad.name,
+                        error=bad.error,
+                        raw_args=clip(bad.raw_args, 500),
+                    )
+                    self._emit(
+                        on_event,
+                        "malformed_tool_call",
+                        name=bad.name,
+                        error=bad.error,
+                    )
+                    self.remember(
+                        memory.notes,
+                        f"malformed tool call to '{bad.name or 'unknown'}' "
+                        f"({bad.error}); arguments must be a single valid JSON object",
+                        5,
+                    )
+                self.log_memory("malformed_tool_call")
 
             if response.tool_calls:
                 for call in response.tool_calls:
@@ -351,7 +378,18 @@ class MiniAgent:
 
             final = response.content.strip()
             if not final:
-                notice = self.retry_notice("model returned no tool call and no answer")
+                if response.malformed_tool_calls:
+                    problems = "; ".join(
+                        f"{bad.name or 'unknown'}: {bad.error}"
+                        for bad in response.malformed_tool_calls
+                    )
+                    notice = self.retry_notice(
+                        f"model produced malformed tool calls ({problems})"
+                    )
+                else:
+                    notice = self.retry_notice(
+                        "model returned no tool call and no answer"
+                    )
                 self.logger.log("retry", attempt=attempts, notice=clip(notice, 500))
                 self._emit(on_event, "retry", notice=notice)
                 self.record(

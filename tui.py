@@ -295,6 +295,13 @@ class MiniAgentApp(App):
             self.call_from_thread(
                 self._write_tool_result, data["name"], data.get("result", "")
             )
+        elif event_type == "malformed_tool_call":
+            self.call_from_thread(
+                self._write_notice,
+                f"malformed tool call: {data.get('name') or 'unknown'} "
+                f"({data.get('error', '')})",
+                "yellow",
+            )
         elif event_type == "retry":
             self.call_from_thread(
                 self._write_notice, "retrying: " + data.get("notice", ""), "yellow"

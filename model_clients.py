@@ -1,11 +1,30 @@
 import json
 
-from typing import Dict, List, Self
+from typing import Dict, List, Self, Tuple
 
 from openai import OpenAI, OpenAIError
 
 from agent_logging import AgentLogger
-from app_types import ModelResponse, ToolCall
+from app_types import MalformedToolCall, ModelResponse, ToolCall
+
+
+def format_completion_for_log(completion, compact=False) -> str:
+    """
+    Converts an OpenAI ChatCompletion response object into a formatted JSON string.
+
+    Parameters:
+    - completion: The ChatCompletion object returned by openai.chat.completions.create()
+    - compact: If True, returns a single-line string. If False, returns pretty-printed JSON.
+    """
+    # .model_dump_json() handles all nested Pydantic models, dates, and enums natively
+    json_str = completion.model_dump_json()
+
+    if compact:
+        return json_str
+
+    # Pretty-print for human readability in standard log files
+    parsed = json.loads(json_str)
+    return json.dumps(parsed, indent=4)
 
 
 class LlamaCppModelClient:
@@ -68,19 +87,45 @@ class LlamaCppModelClient:
         except OpenAIError as exc:
             raise RuntimeError(f"LlamaCpp chat completion failed: {exc}") from exc
 
-    @staticmethod
-    def __parse_tool_calls(message) -> List[ToolCall]:
-        calls = []
+    def __parse_tool_calls(
+        self: Self, message
+    ) -> Tuple[List[ToolCall], List[MalformedToolCall]]:
+        calls: List[ToolCall] = []
+        malformed: List[MalformedToolCall] = []
         for call in message.tool_calls or []:
+            name = call.function.name or ""
             raw_args = call.function.arguments or "{}"
-            try:
-                args = json.loads(raw_args)
-            except json.JSONDecodeError:
-                args = {}
-            if not isinstance(args, dict):
-                args = {}
-            calls.append(ToolCall(id=call.id, name=call.function.name, args=args))
-        return calls
+            error = ""
+            args = None
+            if not name:
+                error = "missing tool name"
+            else:
+                try:
+                    args = json.loads(raw_args)
+                except json.JSONDecodeError as exc:
+                    error = f"arguments are not valid JSON ({exc})"
+                else:
+                    if not isinstance(args, dict):
+                        error = (
+                            "arguments are not a JSON object "
+                            f"(got {type(args).__name__})"
+                        )
+            if error:
+                self.logger.log(
+                    "malformed_tool_call",
+                    id=call.id,
+                    name=name,
+                    raw_args=raw_args,
+                    error=error,
+                )
+                malformed.append(
+                    MalformedToolCall(
+                        id=call.id, name=name, raw_args=raw_args, error=error
+                    )
+                )
+                continue
+            calls.append(ToolCall(id=call.id, name=name, args=args))
+        return calls, malformed
 
     def complete(
         self: Self,
@@ -107,17 +152,22 @@ class LlamaCppModelClient:
 
         assistant_message = ""
         tool_calls: List[ToolCall] = []
+        malformed_tool_calls: List[MalformedToolCall] = []
         round_index = 0
         has_more_data = True
         while has_more_data:
             completion = self.__create(messages, tools, max_new_tokens)
+            with open("llm_response.txt", "a+") as f:
+                f.write(format_completion_for_log(completion))
+                f.write("\n============================\n\n\n")
+
             round_index += 1
 
             choice = completion.choices[0]
             message = choice.message
             chunk = message.content or ""
             assistant_message += chunk
-            tool_calls = self.__parse_tool_calls(message)
+            tool_calls, malformed_tool_calls = self.__parse_tool_calls(message)
             finish_reason = choice.finish_reason
             usage = completion.usage.model_dump() if completion.usage else None
             self.logger.log(
@@ -128,11 +178,19 @@ class LlamaCppModelClient:
                 tool_calls=[
                     {"name": call.name, "args": call.args} for call in tool_calls
                 ],
+                malformed_tool_calls=[
+                    {"name": bad.name, "error": bad.error, "raw_args": bad.raw_args}
+                    for bad in malformed_tool_calls
+                ],
                 content=chunk,
             )
 
             # Only plain-text answers are continued; tool calls finish a turn.
-            if finish_reason == "length" and not tool_calls:
+            if (
+                finish_reason == "length"
+                and not tool_calls
+                and not malformed_tool_calls
+            ):
                 messages = messages + [
                     {"role": "assistant", "content": assistant_message}
                 ]
@@ -145,4 +203,8 @@ class LlamaCppModelClient:
             else:
                 has_more_data = False
 
-        return ModelResponse(content=assistant_message, tool_calls=tool_calls)
+        return ModelResponse(
+            content=assistant_message,
+            tool_calls=tool_calls,
+            malformed_tool_calls=malformed_tool_calls,
+        )
