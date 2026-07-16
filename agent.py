@@ -7,7 +7,7 @@ from agent_logging import AgentLogger
 from model_clients import LlamaCppModelClient
 from session import SessionStore
 from tools import ToolRegistry
-from typing import Callable, Dict, List, Self, Tuple
+from typing import Callable, Dict, List, Self
 from workspace import WorkspaceContext
 from app_types import (
     HistoryEntry,
@@ -137,6 +137,7 @@ class MiniAgent:
                 "- Before writing tests for existing code, read the implementation first.",
                 "- When writing tests, match the current implementation unless the user explicitly asked you to change the code.",
                 "- New files should be complete and runnable, including obvious imports.",
+                "- To create a long file, write the first part with write_file and continue with append_file; do not try to fit it all in one call.",
                 "- Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or give a final answer.",
                 "- Required tool arguments must not be empty.",
             ]
@@ -145,6 +146,7 @@ class MiniAgent:
             [
                 "You are Mini-Coding-Agent, a small local coding agent running through llama-server.",
                 "Rules:\n" + rules,
+                self.workspace.text(),
             ]
         )
 
@@ -161,31 +163,34 @@ class MiniAgent:
             ]
         )
 
+    @staticmethod
+    def _stale_read_indices(history: List[HistoryEntry]) -> set:
+        """Indices of read_file entries superseded by a later read of the same
+        path; only the latest read carries current file content."""
+        last_read: Dict[str, int] = {}
+        for index, item in enumerate(history):
+            if isinstance(item, ToolMessageEntry) and item.name == "read_file":
+                last_read[str(item.args.get("path", ""))] = index
+        return {
+            index
+            for index, item in enumerate(history)
+            if isinstance(item, ToolMessageEntry)
+            and item.name == "read_file"
+            and last_read[str(item.args.get("path", ""))] != index
+        }
+
     def history_text(self: Self) -> str:
         history: List[HistoryEntry] = self.session.history
         if not history:
             return "- empty"
 
         lines = []
-        seen_reads = set()
+        stale_reads = self._stale_read_indices(history)
         recent_start = max(0, len(history) - 6)
         for index, item in enumerate(history):
             recent = index >= recent_start
-            if isinstance(item, ToolMessageEntry) and item.name in (
-                "write_file",
-                "patch_file",
-            ):
-                path = str(item.args.get("path", ""))
-                seen_reads.discard(path)
-            if (
-                isinstance(item, ToolMessageEntry)
-                and item.name == "read_file"
-                and not recent
-            ):
-                path = str(item.args.get("path", ""))
-                if path in seen_reads:
-                    continue
-                seen_reads.add(path)
+            if index in stale_reads and not recent:
+                continue
 
             if isinstance(item, ToolMessageEntry):
                 limit = 900 if recent else 180
@@ -199,15 +204,94 @@ class MiniAgent:
 
         return clip("\n".join(lines), MAX_HISTORY)
 
-    def prompt(self: Self, user_message: str) -> Tuple[str, str]:
-        return self.prefix, "\n\n".join(
-            [
-                self.workspace.text(),
-                self.memory_text(),
-                "Transcript:\n" + self.history_text(),
-                "Current user request:\n" + user_message,
-            ]
+    @staticmethod
+    def _group_chars(group: List[Dict]) -> int:
+        return sum(
+            len(str(message.get("content") or ""))
+            + len(json.dumps(message.get("tool_calls", "")))
+            for message in group
         )
+
+    def build_messages(self: Self, user_message: str) -> List[Dict]:
+        """Build the native chat-message list sent to the model.
+
+        Tool results go back as role="tool" messages tied to assistant
+        tool_calls turns, matching the format the model was trained on,
+        instead of a flattened text transcript. Older entries are clipped
+        harder than recent ones and stale reads are dropped to stay inside
+        the context budget.
+        """
+        history: List[HistoryEntry] = self.session.history
+        stale_reads = self._stale_read_indices(history)
+        recent_start = max(0, len(history) - 6)
+
+        groups: List[List[Dict]] = []
+        for index, item in enumerate(history):
+            recent = index >= recent_start
+            if isinstance(item, ToolMessageEntry):
+                if index in stale_reads and not recent:
+                    continue
+                call_id = item.call_id or f"call_{index}"
+                groups.append(
+                    [
+                        {
+                            "role": "assistant",
+                            "content": item.assistant_text or "",
+                            "tool_calls": [
+                                {
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": item.name,
+                                        "arguments": json.dumps(item.args),
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": clip(item.content, 900 if recent else 180),
+                        },
+                    ]
+                )
+            else:
+                # Runtime notices are stored as "system" but sent as user
+                # turns: many chat templates only accept a leading system
+                # message, and correction should not come in the model's own
+                # (assistant) voice.
+                role = "user" if item.role == "system" else item.role
+                groups.append(
+                    [{"role": role, "content": clip(item.content, 900 if recent else 220)}]
+                )
+
+        # The model always ends on a user turn restating memory and the
+        # current request. On the first iteration that replaces the freshly
+        # recorded user message instead of duplicating it.
+        context = self.memory_text() + "\n\nCurrent user request:\n" + user_message
+        if (
+            groups
+            and isinstance(history[-1], MessageEntry)
+            and history[-1].role == "user"
+        ):
+            groups[-1] = [{"role": "user", "content": context}]
+        else:
+            groups.append([{"role": "user", "content": context}])
+
+        total = sum(self._group_chars(group) for group in groups)
+        while len(groups) > 1 and total > MAX_HISTORY:
+            total -= self._group_chars(groups.pop(0))
+
+        messages: List[Dict] = [{"role": "system", "content": self.prefix}]
+        for group in groups:
+            for message in group:
+                # Merge adjacent user turns (e.g. a runtime notice followed by
+                # the context refresher) for strict-alternation templates.
+                if message["role"] == "user" and messages[-1]["role"] == "user":
+                    messages[-1]["content"] += "\n\n" + message["content"]
+                else:
+                    messages.append(message)
+        return messages
 
     def memory_snapshot(self: Self) -> Dict[str, object]:
         memory = self.session.memory
@@ -244,7 +328,7 @@ class MiniAgent:
     def note_tool(self: Self, name: str, args: Dict[str, str], result: str) -> None:
         memory = self.session.memory
         path = args.get("path")
-        if name in {"read_file", "write_file", "patch_file"} and path:
+        if name in {"read_file", "write_file", "patch_file", "append_file"} and path:
             self.remember(memory.files, str(path), 8)
         note = f"{name}: {clip(str(result).replace(chr(10), ' '), 220)}"
         self.remember(memory.notes, note, 5)
@@ -288,19 +372,20 @@ class MiniAgent:
         while tool_steps < self.max_steps and attempts < max_attempts:
             attempts += 1
             self._emit(on_event, "thinking", attempt=attempts, step=tool_steps)
-            system_prompt, user_prompt = self.prompt(user_message)
+            messages = self.build_messages(user_message)
             self.logger.log(
                 "prompt_built",
                 attempt=attempts,
                 tool_step=tool_steps,
-                system_len=len(system_prompt),
-                user_len=len(user_prompt),
+                message_count=len(messages),
+                roles=[message["role"] for message in messages],
+                chars=sum(
+                    len(str(message.get("content") or "")) for message in messages
+                ),
                 memory_text=self.memory_text(),
-                history_text=self.history_text(),
             )
             response = self.model_client.complete(
-                system_prompt,
-                user_prompt,
+                messages,
                 self.max_new_tokens,
                 tools=self.tools.schemas(),
             )
@@ -340,6 +425,9 @@ class MiniAgent:
                 self.log_memory("malformed_tool_call")
 
             if response.tool_calls:
+                # Keep the model's plan text attached to its first tool call
+                # so the transcript preserves its thread of thought.
+                assistant_text = response.content.strip()
                 for call in response.tool_calls:
                     tool_steps += 1
                     name = call.name
@@ -369,31 +457,39 @@ class MiniAgent:
                             args=args,
                             content=result,
                             created_at=now(),
+                            call_id=call.id or "",
+                            assistant_text=assistant_text,
                         )
                     )
+                    assistant_text = ""
                     self.note_tool(name, args, result)
                     if tool_steps >= self.max_steps:
                         break
+                if response.malformed_tool_calls:
+                    self.record_retry(
+                        on_event, attempts, self.malformed_notice(response)
+                    )
                 continue
 
             final = response.content.strip()
+            if response.malformed_tool_calls:
+                # A broken tool call plus text like "I'll read the file now"
+                # is an intent to act, not an answer; keep the plan in the
+                # transcript but force a corrected retry.
+                if final:
+                    self.record(
+                        MessageEntry(
+                            role="assistant", content=final, created_at=now()
+                        )
+                    )
+                self.record_retry(on_event, attempts, self.malformed_notice(response))
+                continue
+
             if not final:
-                if response.malformed_tool_calls:
-                    problems = "; ".join(
-                        f"{bad.name or 'unknown'}: {bad.error}"
-                        for bad in response.malformed_tool_calls
-                    )
-                    notice = self.retry_notice(
-                        f"model produced malformed tool calls ({problems})"
-                    )
-                else:
-                    notice = self.retry_notice(
-                        "model returned no tool call and no answer"
-                    )
-                self.logger.log("retry", attempt=attempts, notice=clip(notice, 500))
-                self._emit(on_event, "retry", notice=notice)
-                self.record(
-                    MessageEntry(role="assistant", content=notice, created_at=now())
+                self.record_retry(
+                    on_event,
+                    attempts,
+                    self.retry_notice("model returned no tool call and no answer"),
                 )
                 continue
 
@@ -426,6 +522,35 @@ class MiniAgent:
         )
         self._emit(on_event, "final", text=final, reason=reason)
         return final
+
+    def record_retry(
+        self: Self,
+        on_event: Callable[..., None] | None,
+        attempts: int,
+        notice: str,
+    ) -> None:
+        """Record a corrective notice and surface it to the UI.
+
+        Stored with role "system" so the correction does not appear in the
+        model's own (assistant) voice, which small models tend to imitate.
+        """
+        self.logger.log("retry", attempt=attempts, notice=clip(notice, 500))
+        self._emit(on_event, "retry", notice=notice)
+        self.record(MessageEntry(role="system", content=notice, created_at=now()))
+
+    def malformed_notice(self: Self, response) -> str:
+        problems = "; ".join(
+            f"{bad.name or 'unknown'}: {bad.error}"
+            for bad in response.malformed_tool_calls
+        )
+        if response.truncated:
+            return (
+                "Runtime notice: the tool call was cut off by the output token "
+                f"limit ({problems}). Produce a shorter call: write the first "
+                "part of the file with write_file, then extend it with "
+                "append_file."
+            )
+        return self.retry_notice(f"model produced malformed tool calls ({problems})")
 
     @staticmethod
     def retry_notice(problem: str | None = None) -> str:

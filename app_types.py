@@ -23,7 +23,7 @@ class Memory:
 
 @dataclass
 class MessageEntry:
-    role: str  # "user" or "assistant"
+    role: str  # "user", "assistant" or "system" (runtime notices)
     content: str
     created_at: str
 
@@ -35,6 +35,11 @@ class ToolMessageEntry:
     args: Dict[str, Any]
     content: str
     created_at: str
+    # Id assigned by the model backend, echoed back as tool_call_id.
+    call_id: str = ""
+    # Plan/reasoning text the model emitted alongside this tool call; kept so
+    # the transcript preserves the model's own thread of thought.
+    assistant_text: str = ""
 
 
 @dataclass
@@ -57,6 +62,9 @@ class ModelResponse:
     content: str
     tool_calls: List[ToolCall]
     malformed_tool_calls: List[MalformedToolCall] = field(default_factory=list)
+    # True when generation stopped at the token limit mid tool call, so the
+    # arguments are cut off rather than genuinely malformed.
+    truncated: bool = False
 
 
 HistoryEntry: TypeAlias = Union[MessageEntry, ToolMessageEntry]

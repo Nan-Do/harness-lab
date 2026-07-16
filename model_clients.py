@@ -8,25 +8,6 @@ from agent_logging import AgentLogger
 from app_types import MalformedToolCall, ModelResponse, ToolCall
 
 
-def format_completion_for_log(completion, compact=False) -> str:
-    """
-    Converts an OpenAI ChatCompletion response object into a formatted JSON string.
-
-    Parameters:
-    - completion: The ChatCompletion object returned by openai.chat.completions.create()
-    - compact: If True, returns a single-line string. If False, returns pretty-printed JSON.
-    """
-    # .model_dump_json() handles all nested Pydantic models, dates, and enums natively
-    json_str = completion.model_dump_json()
-
-    if compact:
-        return json_str
-
-    # Pretty-print for human readability in standard log files
-    parsed = json.loads(json_str)
-    return json.dumps(parsed, indent=4)
-
-
 class LlamaCppModelClient:
     def __check_model(self: Self):
         try:
@@ -82,6 +63,10 @@ class LlamaCppModelClient:
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+            # One call per turn: the agent loop feeds each result back before
+            # the model picks its next action, so a second parallel call would
+            # be chosen blind.
+            kwargs["parallel_tool_calls"] = False
         try:
             return self.client.chat.completions.create(**kwargs)
         except OpenAIError as exc:
@@ -129,15 +114,10 @@ class LlamaCppModelClient:
 
     def complete(
         self: Self,
-        system: str,
-        prompt: str,
+        messages: List[Dict],
         max_new_tokens: int,
         tools: List[Dict] | None = None,
     ) -> ModelResponse:
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ]
         self.logger.log(
             "llm_request",
             backend="llama-server",
@@ -153,14 +133,11 @@ class LlamaCppModelClient:
         assistant_message = ""
         tool_calls: List[ToolCall] = []
         malformed_tool_calls: List[MalformedToolCall] = []
+        truncated = False
         round_index = 0
         has_more_data = True
         while has_more_data:
             completion = self.__create(messages, tools, max_new_tokens)
-            with open("llm_response.txt", "a+") as f:
-                f.write(format_completion_for_log(completion))
-                f.write("\n============================\n\n\n")
-
             round_index += 1
 
             choice = completion.choices[0]
@@ -201,10 +178,17 @@ class LlamaCppModelClient:
                     messages=messages,
                 )
             else:
+                # A tool call cut off at the token limit produces unparseable
+                # arguments; flag it so the agent can give targeted feedback
+                # instead of a generic "invalid JSON" notice.
+                truncated = finish_reason == "length" and bool(
+                    tool_calls or malformed_tool_calls
+                )
                 has_more_data = False
 
         return ModelResponse(
             content=assistant_message,
             tool_calls=tool_calls,
             malformed_tool_calls=malformed_tool_calls,
+            truncated=truncated,
         )

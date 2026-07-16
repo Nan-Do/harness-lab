@@ -56,7 +56,7 @@ def agent_tool(
 @agent_tool(
     name="list_files",
     description="List files in the workspace.",
-    schema={"path": "str='.'"},
+    schema={"path": "str='.'|Directory to list, relative to the repo root"},
     example='arguments: {"path": "."}',
 )
 def list_files_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
@@ -84,7 +84,11 @@ def list_files_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
 @agent_tool(
     name="read_file",
     description="Read a UTF-8 file by line range.",
-    schema={"path": "str", "start": "int=1", "end": "int=200"},
+    schema={
+        "path": "str|File path relative to the repo root",
+        "start": "int=1|First line to read (1-based)",
+        "end": "int=200|Last line to read (inclusive)",
+    },
     example='arguments: {"path": "README.md", "start": 1, "end": 80}',
 )
 def read_file_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
@@ -113,7 +117,10 @@ def read_file_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
 @agent_tool(
     name="search",
     description="Search the workspace with rg or a simple fallback.",
-    schema={"pattern": "str", "path": "str='.'"},
+    schema={
+        "pattern": "str|Text to search for",
+        "path": "str='.'|File or directory to search in, relative to the repo root",
+    },
     example='arguments: {"pattern": "binary_search", "path": "."}',
 )
 def search_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
@@ -165,7 +172,10 @@ def search_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
 @agent_tool(
     name="run_shell",
     description="Run a shell command in the repo root.",
-    schema={"command": "str", "timeout": "int=20"},
+    schema={
+        "command": "str|Shell command executed at the repo root",
+        "timeout": "int=20|Timeout in seconds, between 1 and 120",
+    },
     risky=True,
     example='arguments: {"command": "uv run --with pytest python -m pytest -q", "timeout": 20}',
 )
@@ -201,8 +211,14 @@ def run_shell_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
 
 @agent_tool(
     name="write_file",
-    description="Write a text file.",
-    schema={"path": "str", "content": "str"},
+    description=(
+        "Write a text file, replacing any existing content. "
+        "For long files write only the first part, then continue with append_file."
+    ),
+    schema={
+        "path": "str|File path relative to the repo root",
+        "content": "str|Full text content of the file",
+    },
     risky=True,
     example='arguments: {"path": "binary_search.py", "content": "def binary_search(nums, target):\\n    return -1\\n"}',
 )
@@ -229,7 +245,11 @@ def write_file_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
 @agent_tool(
     name="patch_file",
     description="Replace one exact text block in a file.",
-    schema={"path": "str", "old_text": "str", "new_text": "str"},
+    schema={
+        "path": "str|File path relative to the repo root",
+        "old_text": "str|Exact existing text to replace; must occur exactly once",
+        "new_text": "str|Replacement text",
+    },
     risky=True,
     example='arguments: {"path": "binary_search.py", "old_text": "return -1", "new_text": "return mid"}',
 )
@@ -261,9 +281,48 @@ def patch_file_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
 
 
 @agent_tool(
+    name="append_file",
+    description=(
+        "Append text to the end of a file, creating it if missing. "
+        "Use it to build long files piece by piece after an initial write_file."
+    ),
+    schema={
+        "path": "str|File path relative to the repo root",
+        "content": "str|Text appended verbatim to the end of the file",
+    },
+    risky=True,
+    example='arguments: {"path": "binary_search.py", "content": "\\n\\ndef test_empty():\\n    assert binary_search([], 1) == -1\\n"}',
+)
+def append_file_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
+    if "path" not in args:
+        raise ValueError("missing path")
+    path = registry._path(args["path"])
+
+    if path.exists() and path.is_dir():
+        raise ValueError("path is a directory")
+    if "content" not in args:
+        raise ValueError("missing content")
+
+    content = str(args["content"])
+
+    def execute() -> str:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(content)
+        return (
+            f"appended {len(content)} chars to {path.relative_to(registry.root)}"
+        )
+
+    return execute
+
+
+@agent_tool(
     name="delegate",
     description="Ask a bounded read-only child agent to investigate.",
-    schema={"task": "str", "max_steps": "int=3"},
+    schema={
+        "task": "str|Question for the child agent to investigate",
+        "max_steps": "int=3|Tool budget for the child agent",
+    },
     example='arguments: {"task": "inspect README.md", "max_steps": 3}',
 )
 def delegate_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
@@ -321,15 +380,44 @@ class ToolRegistry:
         "bool": "boolean",
     }
 
+    @staticmethod
+    def _split_spec(spec: str) -> tuple[str, str, bool, str]:
+        """Split a "type[=default]|description" field spec.
+
+        Returns (type token, default token, required, description).
+        """
+        head, _, description = str(spec).partition("|")
+        type_token, sep, default = head.partition("=")
+        return type_token.strip(), default.strip(), sep == "", description.strip()
+
+    @staticmethod
+    def _parse_default(json_type: str, token: str):
+        try:
+            if json_type == "integer":
+                return int(token)
+            if json_type == "number":
+                return float(token)
+        except ValueError:
+            return token
+        if json_type == "boolean":
+            return token.lower() == "true"
+        return token.strip("'\"")
+
     @classmethod
     def _field_schema(cls, spec: str) -> tuple[dict, bool]:
-        """Convert a "type[=default]" field spec into a JSON-schema property.
+        """Convert a "type[=default]|description" field spec into a JSON-schema
+        property.
 
         Returns the property schema and whether the field is required.
         """
-        type_token, sep, _default = str(spec).partition("=")
-        json_type = cls._JSON_TYPES.get(type_token.strip(), "string")
-        return {"type": json_type}, sep == ""
+        type_token, default, required, description = cls._split_spec(spec)
+        json_type = cls._JSON_TYPES.get(type_token, "string")
+        prop = {"type": json_type}
+        if description:
+            prop["description"] = description
+        if not required:
+            prop["default"] = cls._parse_default(json_type, default)
+        return prop, required
 
     def schemas(self) -> List[Dict]:
         """Return the registered tools as OpenAI-style JSON-schema definitions."""
@@ -342,12 +430,17 @@ class ToolRegistry:
                 properties[field] = prop
                 if is_required:
                     required.append(field)
+            # Priming with an example beats correcting after a failure.
+            description = tool.description
+            example = _TOOL_EXAMPLES.get(name)
+            if example:
+                description += f" Example {example}"
             definitions.append(
                 {
                     "type": "function",
                     "function": {
                         "name": name,
-                        "description": tool.description,
+                        "description": description,
                         "parameters": {
                             "type": "object",
                             "properties": properties,
@@ -357,6 +450,38 @@ class ToolRegistry:
                 }
             )
         return definitions
+
+    def _coerce_args(self, tool: ToolDescriptionEntry, args: Dict) -> Dict:
+        """Coerce scalar arguments to their declared types.
+
+        Small models frequently send "20" for an int or 1 for a str; a
+        wrong-but-unambiguous type should not burn a retry. Values that cannot
+        be coerced are left as-is so the tool's own validation reports them.
+        """
+        coerced = dict(args)
+        for field, spec in tool.schema.items():
+            if field not in coerced:
+                continue
+            type_token = self._split_spec(spec)[0]
+            value = coerced[field]
+            try:
+                if type_token == "int" and isinstance(value, str):
+                    coerced[field] = int(value.strip())
+                elif (
+                    type_token == "int"
+                    and isinstance(value, float)
+                    and value.is_integer()
+                ):
+                    coerced[field] = int(value)
+                elif type_token == "float" and isinstance(value, (str, int)):
+                    coerced[field] = float(value)
+                elif type_token == "bool" and isinstance(value, str):
+                    coerced[field] = value.strip().lower() in {"true", "yes", "1"}
+                elif type_token == "str" and isinstance(value, (int, float, bool)):
+                    coerced[field] = str(value)
+            except ValueError:
+                continue
+        return coerced
 
     def run(self, name: str, args: Dict) -> str:
         tool = self._registry.get(name, None)
@@ -369,6 +494,8 @@ class ToolRegistry:
                 "tool_blocked", name=name, args=args, reason="repeated_call"
             )
             return f"error: repeated identical tool call for {name}; choose a different tool or return a final answer"
+
+        args = self._coerce_args(tool, args or {})
 
         try:
             # Validate the arguments first so approval is only requested for
