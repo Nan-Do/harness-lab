@@ -2,7 +2,7 @@
 
 # Interactive Example
 
-This is a hands-on walkthrough of `mini-coding-agent` against `llama-server`
+This is a hands-on walkthrough of `harness-lab` against `llama-server`
 on a small Python project.
 
 The flow is:
@@ -48,7 +48,7 @@ repo:
 
 ```bash
 cd mini-coding-agent
-uv run mini-coding-agent \
+uv run harness-lab \
   --cwd ./tmp/binary-search-repo \
   --model "Qwen3.5-4B-Q4_K_M.gguf"
 ```
@@ -153,8 +153,8 @@ Every step above was recorded as structured JSONL. Find the path with
 `/log` inside the agent, or list the log directory directly:
 
 ```bash
-ls .mini-coding-agent/logs/
-uv run python log_viewer.py .mini-coding-agent/logs/run-<timestamp>.jsonl --show_events
+ls .harness-lab/logs/
+uv run python log_viewer.py .harness-lab/logs/run-<timestamp>.jsonl --show_events
 ```
 
 This is the basis for comparing harness changes: rerun the same prompts

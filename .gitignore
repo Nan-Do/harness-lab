@@ -21,7 +21,7 @@ dist/
 htmlcov/
 
 # Temporary files
-.mini-coding-agent
+.harness-lab
 *.tmp
 *.temp
 *.swp

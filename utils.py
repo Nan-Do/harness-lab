@@ -27,7 +27,7 @@ MAX_TOOL_OUTPUT = 4000
 MAX_HISTORY = 12000
 IGNORED_PATH_NAMES = {
     ".git",
-    ".mini-coding-agent",
+    ".harness-lab",
     "__pycache__",
     ".pytest_cache",
     ".ruff_cache",

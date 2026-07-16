@@ -144,7 +144,7 @@ class MiniAgent:
         )
         return "\n\n".join(
             [
-                "You are Mini-Coding-Agent, a small local coding agent running through llama-server.",
+                "You are Harness Lab, a small local coding agent running through llama-server.",
                 "Rules:\n" + rules,
                 self.workspace.text(),
             ]

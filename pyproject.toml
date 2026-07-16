@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mini-coding-agent"
+name = "harness-lab"
 version = "0.1.0"
-description = "Minimal standalone coding agent backed by llama.cpp (llama-server)"
+description = "Experimentation harness for coding agents backed by llama.cpp (llama-server)"
 requires-python = ">=3.10"
 dependencies = [
     "openai>=1.40.0",
@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-mini-coding-agent = "main:main"
+harness-lab = "main:main"
 
 [dependency-groups]
 dev = [

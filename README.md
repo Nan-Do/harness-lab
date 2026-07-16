@@ -1,6 +1,6 @@
-# Mini Coding Agent
+# Harness Lab
 
-Mini Coding Agent is a small, readable coding-agent harness for local models
+Harness Lab is a small, readable coding-agent harness for local models
 served through `llama-server` (llama.cpp). It exists to let you experiment
 with the pieces that make an agent harness work — the system prompt and
 rules, the tool set, how context and memory are compacted, and the approval
@@ -23,7 +23,7 @@ diff the two runs to see what the change actually did.
 | `model_clients.py` | OpenAI-compatible client for `llama-server`, tool-call parsing |
 | `app_types.py` | Dataclasses shared across the codebase (history entries, tool calls, session) |
 | `workspace.py` | One-shot collection of repo facts (branch, status, recent commits, project docs) |
-| `session.py` | Loads/saves session transcripts as JSON under `.mini-coding-agent/sessions/` |
+| `session.py` | Loads/saves session transcripts as JSON under `.harness-lab/sessions/` |
 | `agent_logging.py` | Structured JSONL logger used everywhere in the loop |
 | `log_viewer.py` | Standalone CLI to pretty-print and filter a run's JSONL log |
 | `tui.py` | Textual-based interactive front-end |
@@ -80,7 +80,7 @@ diff the two runs to see what the change actually did.
 
 Optional:
 
-- `uv` for environment management and the `mini-coding-agent` CLI entry point
+- `uv` for environment management and the `harness-lab` CLI entry point
 
 This project has no runtime dependency beyond `openai` (used as an
 OpenAI-compatible HTTP client against `llama-server`) and `textual` (TUI), so
@@ -137,19 +137,19 @@ uv sync
 Start the interactive TUI:
 
 ```bash
-uv run mini-coding-agent
+uv run harness-lab
 ```
 
 Run a single one-shot request and print the answer (no TUI):
 
 ```bash
-uv run mini-coding-agent "list the files in this repo"
+uv run harness-lab "list the files in this repo"
 ```
 
 Piped input is also treated as a one-shot headless request:
 
 ```bash
-echo "summarize README.md" | uv run mini-coding-agent
+echo "summarize README.md" | uv run harness-lab
 ```
 
 `--mode` overrides this auto-detection: `--mode tui` always launches the
@@ -187,7 +187,7 @@ gated by approval.
 Example:
 
 ```bash
-uv run mini-coding-agent --approval auto
+uv run harness-lab --approval auto
 ```
 
 &nbsp;
@@ -197,19 +197,19 @@ uv run mini-coding-agent --approval auto
 The agent saves sessions under the target workspace root in:
 
 ```text
-.mini-coding-agent/sessions/
+.harness-lab/sessions/
 ```
 
 Resume the latest session:
 
 ```bash
-uv run mini-coding-agent --resume latest
+uv run harness-lab --resume latest
 ```
 
 Resume a specific session:
 
 ```bash
-uv run mini-coding-agent --resume 20260401-144025-2dd0aa
+uv run harness-lab --resume 20260401-144025-2dd0aa
 ```
 
 &nbsp;
@@ -236,7 +236,7 @@ command handling).
 ## Main CLI flags
 
 ```bash
-uv run mini-coding-agent --help
+uv run harness-lab --help
 ```
 
 Without `uv`:
@@ -262,7 +262,7 @@ python main.py --help
 - `--temperature` — sampling temperature sent to `llama-server`; default `0.2`
 - `--top-p` — nucleus sampling value sent to `llama-server`; default `0.9`
 - `--log-dir` — directory for JSONL run logs; default
-  `<workspace>/.mini-coding-agent/logs`
+  `<workspace>/.harness-lab/logs`
 - `--no-log` — disables structured logging entirely
 
 &nbsp;
@@ -300,7 +300,7 @@ Notes:
 ## Logging
 
 By default each run writes a structured [JSON Lines](https://jsonlines.org)
-log to `.mini-coding-agent/logs/run-<timestamp>.jsonl` (under the workspace
+log to `.harness-lab/logs/run-<timestamp>.jsonl` (under the workspace
 root, so it is already git-ignored). It records everything the agent stores
 and exchanges, in order:
 
@@ -322,15 +322,15 @@ session id, and agent `depth` (nested `delegate` agents log to the same
 file). Inspect a run with `jq`:
 
 ```bash
-cat .mini-coding-agent/logs/run-*.jsonl | jq 'select(.event=="llm_request")'
+cat .harness-lab/logs/run-*.jsonl | jq 'select(.event=="llm_request")'
 ```
 
 or with the bundled viewer, which pretty-prints and can filter by event
 type or summarize event counts:
 
 ```bash
-uv run python log_viewer.py .mini-coding-agent/logs/run-*.jsonl --filter llm_request
-uv run python log_viewer.py .mini-coding-agent/logs/run-*.jsonl --show_events
+uv run python log_viewer.py .harness-lab/logs/run-*.jsonl --filter llm_request
+uv run python log_viewer.py .harness-lab/logs/run-*.jsonl --show_events
 ```
 
 &nbsp;

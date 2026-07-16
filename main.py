@@ -15,14 +15,14 @@ from workspace import WorkspaceContext
 def build_logger(args: argparse.Namespace, repo_root: str) -> AgentLogger:
     if args.no_log:
         return AgentLogger(None, enabled=False)
-    log_dir = Path(args.log_dir or Path(repo_root) / ".mini-coding-agent" / "logs")
+    log_dir = Path(args.log_dir or Path(repo_root) / ".harness-lab" / "logs")
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
     return AgentLogger(log_dir / f"run-{run_id}.jsonl")
 
 
 def build_agent(args: argparse.Namespace) -> MiniAgent:
     workspace = WorkspaceContext.build(args.cwd)
-    store = SessionStore(Path(workspace.repo_root) / ".mini-coding-agent" / "sessions")
+    store = SessionStore(Path(workspace.repo_root) / ".harness-lab" / "sessions")
     logger = build_logger(args, workspace.repo_root)
     model = LlamaCppModelClient(
         model=args.model,
@@ -61,7 +61,7 @@ def build_agent(args: argparse.Namespace) -> MiniAgent:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="Minimal coding agent for llama-server models.",
+        description="Harness Lab: an experimentation harness for coding agents backed by llama-server.",
     )
     parser.add_argument("prompt", nargs="*", help="Optional one-shot prompt.")
     parser.add_argument(
@@ -127,7 +127,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--log-dir",
         default=None,
-        help="Directory for JSONL run logs (default: <repo>/.mini-coding-agent/logs).",
+        help="Directory for JSONL run logs (default: <repo>/.harness-lab/logs).",
     )
     parser.add_argument(
         "--no-log",

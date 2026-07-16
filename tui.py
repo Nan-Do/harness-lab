@@ -1,4 +1,4 @@
-"""Textual-based TUI front-end for the mini coding agent."""
+"""Textual-based TUI front-end for Harness Lab."""
 
 from __future__ import annotations
 
@@ -142,7 +142,7 @@ class MiniAgentApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.title = "Mini Coding Agent"
+        self.title = "Harness Lab"
         self.sub_title = f"{self.model} · {self.endpoint}"
         # Route the `ask` approval policy through a modal dialog.
         if self.agent.approval_policy == "ask":
@@ -182,7 +182,7 @@ class MiniAgentApp(App):
             Panel(
                 Text.assemble(
                     (art + "\n\n", "cyan"),
-                    ("Mini Coding Agent\n", "bold cyan"),
+                    ("Harness Lab\n", "bold cyan"),
                     (f"workspace  {self.agent.workspace.cwd}\n", ""),
                     (f"model      {self.model}\n", ""),
                     (f"endpoint   {self.endpoint}\n", ""),
