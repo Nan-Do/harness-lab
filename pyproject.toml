@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mini-coding-agent-ollama"
+name = "mini-coding-agent"
 version = "0.1.0"
-description = "Minimal standalone coding agent backed by Ollama"
+description = "Minimal standalone coding agent backed by llama.cpp (llama-server)"
 requires-python = ">=3.10"
 dependencies = [
     "openai>=1.40.0",
@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-mini-coding-agent = "mini_coding_agent:main"
+mini-coding-agent = "main:main"
 
 [dependency-groups]
 dev = [
@@ -23,4 +23,16 @@ dev = [
 ]
 
 [tool.setuptools]
-py-modules = ["mini_coding_agent"]
+py-modules = [
+    "agent",
+    "agent_logging",
+    "app_types",
+    "log_viewer",
+    "main",
+    "model_clients",
+    "session",
+    "tools",
+    "tui",
+    "utils",
+    "workspace",
+]
