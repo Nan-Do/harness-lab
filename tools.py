@@ -83,6 +83,31 @@ def list_files_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
 
 @agent_tool(
     name="read_file",
+    description="Read a UTF-8 file.",
+    schema={
+        "path": "str|File path relative to the repo root",
+    },
+    example='arguments: {"path": "README.md"}',
+)
+def read_file_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
+    if "path" not in args:
+        raise ValueError("missing path")
+    path = registry._path(args["path"])
+    if not path.is_file():
+        raise ValueError("path is not a file")
+
+    def execute() -> str:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        body = "\n".join(
+            f"{number:>4}: {line}" for number, line in enumerate(lines, start=1)
+        )
+        return f"# {path.relative_to(registry.root)}\n{body}"
+
+    return execute
+
+
+@agent_tool(
+    name="read_file_range",
     description="Read a UTF-8 file by line range.",
     schema={
         "path": "str|File path relative to the repo root",
@@ -91,7 +116,7 @@ def list_files_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
     },
     example='arguments: {"path": "README.md", "start": 1, "end": 80}',
 )
-def read_file_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
+def read_file_range_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
     if "path" not in args:
         raise ValueError("missing path")
     path = registry._path(args["path"])
@@ -309,9 +334,7 @@ def append_file_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(content)
-        return (
-            f"appended {len(content)} chars to {path.relative_to(registry.root)}"
-        )
+        return f"appended {len(content)} chars to {path.relative_to(registry.root)}"
 
     return execute
 
