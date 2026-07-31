@@ -8,7 +8,7 @@ from agent_logging import AgentLogger
 from model_clients import LlamaCppModelClient
 from session import SessionStore
 from tui import run_tui
-from utils import clip
+from utils import DEFAULT_MAX_NOISY_OUTPUT, TOOL_PROFILES
 from workspace import WorkspaceContext
 
 
@@ -33,6 +33,15 @@ def build_agent(args: argparse.Namespace) -> MiniAgent:
         timeout=args.llama_timeout,
         logger=logger,
     )
+    options = dict(
+        approval_policy=args.approval,
+        max_steps=args.max_steps,
+        max_new_tokens=args.max_new_tokens,
+        logger=logger,
+        tool_profile=args.tools,
+        max_noisy_output=max(args.max_tool_output, 0),
+        require_read_before_overwrite=not args.no_write_guard,
+    )
     session_id = args.resume
     if session_id == "latest":
         session_id = store.latest()
@@ -42,19 +51,13 @@ def build_agent(args: argparse.Namespace) -> MiniAgent:
             workspace=workspace,
             session_store=store,
             session_id=session_id,
-            approval_policy=args.approval,
-            max_steps=args.max_steps,
-            max_new_tokens=args.max_new_tokens,
-            logger=logger,
+            **options,
         )
     return MiniAgent(
         model_client=model,
         workspace=workspace,
         session_store=store,
-        approval_policy=args.approval,
-        max_steps=args.max_steps,
-        max_new_tokens=args.max_new_tokens,
-        logger=logger,
+        **options,
     )
 
 
@@ -105,6 +108,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=6,
         help="Maximum tool/model iterations per request.",
+    )
+    parser.add_argument(
+        "--tools",
+        choices=TOOL_PROFILES,
+        default="standard",
+        help=(
+            "Tool set exposed to the model. 'minimal' is the core read/write/shell "
+            "set, 'standard' adds navigation and verification tools, 'full' adds "
+            "delegation and revert. More tools give more reach but cost accuracy "
+            "on small models."
+        ),
+    )
+    parser.add_argument(
+        "--max-tool-output",
+        type=int,
+        default=DEFAULT_MAX_NOISY_OUTPUT,
+        help=(
+            "Character budget for noisy tool output (shell logs, search floods); "
+            "0 disables clipping. File reads are never clipped."
+        ),
+    )
+    parser.add_argument(
+        "--no-write-guard",
+        action="store_true",
+        help=(
+            "Allow write_file to replace an existing file the model has not read "
+            "in this session (the guard is on by default)."
+        ),
     )
     parser.add_argument(
         "--max-new-tokens",
@@ -160,7 +191,7 @@ def run_headless(agent: MiniAgent, prompt: str) -> int:
     if not prompt:
         print("headless mode needs a prompt argument or piped stdin", file=sys.stderr)
         return 2
-    agent.logger.log("repl_input", mode="headless", text=clip(prompt, 2000))
+    agent.logger.log("repl_input", mode="headless", text=prompt)
     try:
         print(agent.ask(prompt))
     except RuntimeError as exc:

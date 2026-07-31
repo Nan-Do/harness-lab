@@ -18,17 +18,16 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Header, Input, RichLog, Static
 
 from agent import MiniAgent
-from utils import HELP_DETAILS, WELCOME_ART, clip
+from utils import HELP_DETAILS, WELCOME_ART
 
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
 def _format_args(args: Dict[str, Any]) -> str:
     try:
-        rendered = json.dumps(args, ensure_ascii=False, sort_keys=True)
+        return json.dumps(args, ensure_ascii=False, sort_keys=True)
     except TypeError:
-        rendered = str(args)
-    return clip(rendered, 160)
+        return str(args)
 
 
 class ApprovalScreen(ModalScreen[bool]):
@@ -214,7 +213,7 @@ class MiniAgentApp(App):
         style = "red" if is_error else "blue"
         self._logview.write(
             Panel(
-                Text(clip(result, 1200)),
+                Text(result),
                 title=f"{name} result",
                 border_style=style,
                 title_align="left",
@@ -265,7 +264,7 @@ class MiniAgentApp(App):
         self._refresh_status()
         prompt = self.query_one("#prompt", Input)
         prompt.disabled = True
-        self.agent.logger.log("repl_input", mode="tui", text=clip(text, 2000))
+        self.agent.logger.log("repl_input", mode="tui", text=text)
         self._run_agent(text)
 
     @work(thread=True, exclusive=True)

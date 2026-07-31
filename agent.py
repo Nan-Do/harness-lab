@@ -6,7 +6,7 @@ from pathlib import Path
 from agent_logging import AgentLogger
 from model_clients import LlamaCppModelClient
 from session import SessionStore
-from tools import ToolRegistry
+from tools import READ_TOOLS, WRITE_TOOLS, ToolRegistry
 from typing import Callable, Dict, List, Self
 from workspace import WorkspaceContext
 from app_types import (
@@ -17,10 +17,15 @@ from app_types import (
     ToolMessageEntry,
 )
 from utils import (
-    MAX_HISTORY,
+    CHARS_PER_TOKEN,
+    DEFAULT_HISTORY_BUDGET,
+    DEFAULT_MAX_NOISY_OUTPUT,
+    context_chars,
     now,
-    clip,
 )
+
+# Tools whose `path` argument names a file worth remembering as in-play.
+FILE_TOOLS = frozenset(READ_TOOLS + WRITE_TOOLS + ("outline_file", "move_file"))
 
 
 class MiniAgent:
@@ -38,6 +43,9 @@ class MiniAgent:
         read_only: bool = False,
         logger: AgentLogger | None = None,
         approval_fn: Callable[[str, Dict], bool] | None = None,
+        tool_profile: str = "standard",
+        max_noisy_output: int = DEFAULT_MAX_NOISY_OUTPUT,
+        require_read_before_overwrite: bool = True,
     ) -> None:
         self.model_client = model_client
         self.workspace = workspace
@@ -50,6 +58,9 @@ class MiniAgent:
         self.depth = depth
         self.max_depth = max_depth
         self.read_only = read_only
+        self.tool_profile = tool_profile
+        self.max_noisy_output = max_noisy_output
+        self.require_read_before_overwrite = require_read_before_overwrite
         self.session = session or Session(
             id=datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
             created_at=now(),
@@ -67,6 +78,7 @@ class MiniAgent:
             resumed=session is not None,
             history_len=len(self.session.history),
         )
+
         self.tools = ToolRegistry(
             workspace=self.workspace,
             root=self.root,
@@ -78,8 +90,40 @@ class MiniAgent:
             delegate_fn=self._make_delegate if self.depth < self.max_depth else None,
             logger=self.logger,
             approval_fn=self.approval_fn,
+            profile=self.tool_profile,
+            max_noisy_output=self.max_noisy_output,
+            require_read_before_overwrite=self.require_read_before_overwrite,
         )
         self.prefix = self.build_prefix()
+
+        # llama-server reports the loaded model's real context window
+        # (n_ctx); size the history budget off of that instead of a fixed
+        # guess, so a large-context model gets to keep more turns and a
+        # small one still fits. Falls back to a conservative fixed budget
+        # when n_ctx is unavailable. This budget is enforced by dropping
+        # whole old turns (see _fit_history_budget), never by truncating
+        # content -- tool output and messages are always sent in full.
+        #
+        # What has to be held back is measured rather than guessed: the tool
+        # schemas alone run to thousands of tokens and grow with --tools, so a
+        # fixed reserve would quietly overcommit the window on the larger
+        # profiles and overflow the model's real context.
+        overhead_chars = len(self.prefix) + len(json.dumps(self.tools.schemas()))
+        reserve_tokens = (
+            self.max_new_tokens + int(overhead_chars / CHARS_PER_TOKEN) + 500
+        )
+        self.history_budget = context_chars(
+            getattr(model_client, "ctx", 0), reserve_tokens, DEFAULT_HISTORY_BUDGET
+        )
+        self.logger.log(
+            "context_budget",
+            n_ctx=getattr(model_client, "ctx", 0),
+            tool_profile=self.tool_profile,
+            tool_count=len(self.tools.schemas()),
+            overhead_chars=overhead_chars,
+            reserve_tokens=reserve_tokens,
+            history_budget_chars=self.history_budget,
+        )
         self.session_path = self.session_store.save(self.session)
 
     @classmethod
@@ -120,9 +164,12 @@ class MiniAgent:
             max_depth=self.max_depth,
             read_only=True,
             logger=self.logger,
+            tool_profile=self.tool_profile,
+            max_noisy_output=self.max_noisy_output,
+            require_read_before_overwrite=self.require_read_before_overwrite,
         )
         child.session.memory.task = task
-        child.session.memory.notes = [clip(self.history_text(), 300)]
+        child.session.memory.notes = [self.history_text()]
         return "delegate_result:\n" + child.ask(task)
 
     def build_prefix(self: Self) -> str:
@@ -138,6 +185,9 @@ class MiniAgent:
                 "- When writing tests, match the current implementation unless the user explicitly asked you to change the code.",
                 "- New files should be complete and runnable, including obvious imports.",
                 "- To create a long file, write the first part with write_file and continue with append_file; do not try to fit it all in one call.",
+                "- To change an existing file, edit it with patch_file or replace_lines; use write_file only for a new file or a full rewrite of a file you have read.",
+                "- For a large file, find the part you need with outline_file, read it with read_file_range, and edit it with replace_lines instead of reading or rewriting the whole file.",
+                "- Copy old_text for patch_file exactly as read_file showed it, without the leading line numbers.",
                 "- Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or give a final answer.",
                 "- Required tool arguments must not be empty.",
             ]
@@ -164,45 +214,95 @@ class MiniAgent:
         )
 
     @staticmethod
-    def _stale_read_indices(history: List[HistoryEntry]) -> set:
-        """Indices of read_file entries superseded by a later read of the same
-        path; only the latest read carries current file content."""
-        last_read: Dict[str, int] = {}
+    def _norm_path(raw: object) -> str:
+        """Normalize a tool path argument so "./x" and "x" compare equal."""
+        text = str(raw or "").strip()
+        return Path(text).as_posix() if text else ""
+
+    @staticmethod
+    def _covers(outer: tuple, inner: tuple) -> bool:
+        """True when line range `outer` fully contains `inner` (None = to EOF)."""
+        outer_start, outer_end = outer
+        inner_start, inner_end = inner
+        outer_end = float("inf") if outer_end is None else outer_end
+        inner_end = float("inf") if inner_end is None else inner_end
+        return outer_start <= inner_start and outer_end >= inner_end
+
+    @classmethod
+    def _stale_read_indices(cls, history: List[HistoryEntry]) -> set:
+        """Indices of file reads that no longer carry current content.
+
+        A read is stale when a later read of the same path covers its line
+        range, or when a later write_file replaced the whole file. Range-aware
+        on purpose: reading lines 1-200 and then 201-400 of a big file leaves
+        both results useful, so neither may be dropped -- that sequence is the
+        intended way to work through a file too large to hold at once. Partial
+        edits (patch_file, replace_lines, append_file) deliberately do not
+        supersede a read: the read is only partly out of date, and dropping it
+        would leave the model with no view of the file at all.
+        """
+        reads: List[tuple] = []
+        replaced: Dict[str, int] = {}
         for index, item in enumerate(history):
-            if isinstance(item, ToolMessageEntry) and item.name == "read_file":
-                last_read[str(item.args.get("path", ""))] = index
-        return {
-            index
-            for index, item in enumerate(history)
-            if isinstance(item, ToolMessageEntry)
-            and item.name == "read_file"
-            and last_read[str(item.args.get("path", ""))] != index
-        }
+            if not isinstance(item, ToolMessageEntry):
+                continue
+            path = cls._norm_path(item.args.get("path"))
+            if not path:
+                continue
+            if str(item.content).startswith("error:"):
+                continue
+            if item.name == "read_file":
+                reads.append((index, path, 1, None))
+            elif item.name == "read_file_range":
+                try:
+                    start = int(item.args.get("start", 1))
+                    end = int(item.args.get("end", 200))
+                except (TypeError, ValueError):
+                    start, end = 1, None
+                reads.append((index, path, start, end))
+            elif item.name == "write_file":
+                replaced[path] = index
+
+        stale = set()
+        for position, (index, path, start, end) in enumerate(reads):
+            if replaced.get(path, -1) > index:
+                stale.add(index)
+                continue
+            for later_index, later_path, later_start, later_end in reads[position + 1 :]:
+                if later_path != path:
+                    continue
+                if cls._covers((later_start, later_end), (start, end)):
+                    stale.add(index)
+                    break
+        return stale
 
     def history_text(self: Self) -> str:
         history: List[HistoryEntry] = self.session.history
         if not history:
             return "- empty"
 
-        lines = []
         stale_reads = self._stale_read_indices(history)
-        recent_start = max(0, len(history) - 6)
+        blocks: List[str] = []
         for index, item in enumerate(history):
-            recent = index >= recent_start
-            if index in stale_reads and not recent:
+            if index in stale_reads:
                 continue
 
             if isinstance(item, ToolMessageEntry):
-                limit = 900 if recent else 180
-                lines.append(
+                blocks.append(
                     f"[tool:{item.name}] {json.dumps(item.args, sort_keys=True)}"
+                    f"\n{item.content}"
                 )
-                lines.append(clip(item.content, limit))
             else:
-                limit = 900 if recent else 220
-                lines.append(f"[{item.role}] {clip(item.content, limit)}")
+                blocks.append(f"[{item.role}] {item.content}")
 
-        return clip("\n".join(lines), MAX_HISTORY)
+        if not blocks:
+            return "- empty"
+
+        total = sum(len(block) for block in blocks)
+        while len(blocks) > 1 and total > self.history_budget:
+            total -= len(blocks.pop(0))
+
+        return "\n".join(blocks)
 
     @staticmethod
     def _group_chars(group: List[Dict]) -> int:
@@ -212,24 +312,85 @@ class MiniAgent:
             for message in group
         )
 
+    @staticmethod
+    def _group_labels(groups: List[List[Dict]]) -> List[str]:
+        """Short "tool path" labels for the tool calls inside these groups."""
+        labels: List[str] = []
+        for group in groups:
+            for message in group:
+                for call in message.get("tool_calls") or []:
+                    function = call.get("function", {})
+                    name = function.get("name", "tool")
+                    try:
+                        args = json.loads(function.get("arguments") or "{}")
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                    path = args.get("path") if isinstance(args, dict) else None
+                    labels.append(f"{name} {path}" if path else str(name))
+        return labels
+
+    def _eviction_notice(self: Self, dropped: List[List[Dict]]) -> str:
+        """Tell the model what it can no longer see.
+
+        Content is sent whole or dropped whole, never truncated -- but a read
+        that silently disappears one turn later is worse than a visible gap:
+        the model goes on editing a file from a memory it no longer has. Naming
+        what went makes the gap recoverable.
+        """
+        labels = self._group_labels(dropped)
+        detail = ", ".join(dict.fromkeys(labels)) if labels else "earlier conversation"
+        return (
+            "[context notice] Older turns were dropped to fit the context window: "
+            f"{detail}. That output is no longer visible to you. Re-read anything "
+            "you still need (read_file_range for a specific part of a large file) "
+            "instead of relying on remembering it."
+        )
+
+    def _fit_history_budget(self: Self, groups: List[List[Dict]]) -> List[List[Dict]]:
+        """Drop the oldest whole turns until the prompt fits history_budget.
+
+        A turn (a tool call + its result, or a single message) is either
+        sent whole or dropped whole -- content is never truncated. The most
+        recent turn (the current request) is never dropped, so the request
+        always goes through even if it alone exceeds the budget. Whatever gets
+        dropped is replaced by a one-line notice so the loss is visible to the
+        model rather than silent.
+        """
+        total = sum(self._group_chars(group) for group in groups)
+        dropped: List[List[Dict]] = []
+        while len(groups) > 1 and total > self.history_budget:
+            removed = groups.pop(0)
+            total -= self._group_chars(removed)
+            dropped.append(removed)
+        if dropped:
+            self.logger.log(
+                "history_window",
+                dropped_turns=len(dropped),
+                dropped_labels=self._group_labels(dropped),
+                kept_turns=len(groups),
+                total_chars=total,
+                budget_chars=self.history_budget,
+            )
+            groups.insert(0, [{"role": "user", "content": self._eviction_notice(dropped)}])
+        return groups
+
     def build_messages(self: Self, user_message: str) -> List[Dict]:
         """Build the native chat-message list sent to the model.
 
         Tool results go back as role="tool" messages tied to assistant
         tool_calls turns, matching the format the model was trained on,
-        instead of a flattened text transcript. Older entries are clipped
-        harder than recent ones and stale reads are dropped to stay inside
-        the context budget.
+        instead of a flattened text transcript. Stale reads are dropped so a
+        superseded snapshot of a file doesn't shadow the current one, and
+        the oldest whole turns are dropped -- never truncated -- once the
+        prompt would exceed the model's context budget.
         """
         history: List[HistoryEntry] = self.session.history
         stale_reads = self._stale_read_indices(history)
-        recent_start = max(0, len(history) - 6)
 
         groups: List[List[Dict]] = []
         for index, item in enumerate(history):
-            recent = index >= recent_start
             if isinstance(item, ToolMessageEntry):
-                if index in stale_reads and not recent:
+                if index in stale_reads:
                     continue
                 call_id = item.call_id or f"call_{index}"
                 groups.append(
@@ -251,7 +412,7 @@ class MiniAgent:
                         {
                             "role": "tool",
                             "tool_call_id": call_id,
-                            "content": clip(item.content, 900 if recent else 180),
+                            "content": item.content,
                         },
                     ]
                 )
@@ -261,9 +422,7 @@ class MiniAgent:
                 # message, and correction should not come in the model's own
                 # (assistant) voice.
                 role = "user" if item.role == "system" else item.role
-                groups.append(
-                    [{"role": role, "content": clip(item.content, 900 if recent else 220)}]
-                )
+                groups.append([{"role": role, "content": item.content}])
 
         # The model always ends on a user turn restating memory and the
         # current request. On the first iteration that replaces the freshly
@@ -278,9 +437,7 @@ class MiniAgent:
         else:
             groups.append([{"role": "user", "content": context}])
 
-        total = sum(self._group_chars(group) for group in groups)
-        while len(groups) > 1 and total > MAX_HISTORY:
-            total -= self._group_chars(groups.pop(0))
+        groups = self._fit_history_budget(groups)
 
         messages: List[Dict] = [{"role": "system", "content": self.prefix}]
         for group in groups:
@@ -313,7 +470,7 @@ class MiniAgent:
                 index=len(self.session.history) - 1,
                 name=item.name,
                 args=item.args,
-                content=clip(item.content, 2000),
+                content=item.content,
             )
         else:
             self.logger.log(
@@ -321,16 +478,16 @@ class MiniAgent:
                 entry="message",
                 index=len(self.session.history) - 1,
                 role=item.role,
-                content=clip(item.content, 2000),
+                content=item.content,
             )
         self.session_path = self.session_store.save(self.session)
 
     def note_tool(self: Self, name: str, args: Dict[str, str], result: str) -> None:
         memory = self.session.memory
         path = args.get("path")
-        if name in {"read_file", "write_file", "patch_file", "append_file"} and path:
+        if name in FILE_TOOLS and path:
             self.remember(memory.files, str(path), 8)
-        note = f"{name}: {clip(str(result).replace(chr(10), ' '), 220)}"
+        note = f"{name}: {str(result).replace(chr(10), ' ')}"
         self.remember(memory.notes, note, 5)
         self.log_memory(f"note_tool:{name}")
 
@@ -355,12 +512,12 @@ class MiniAgent:
     ) -> str:
         memory = self.session.memory
         if not memory.task:
-            memory.task = clip(user_message.strip(), 300)
+            memory.task = user_message.strip()
         self.logger.log(
             "request_start",
             max_steps=self.max_steps,
             max_new_tokens=self.max_new_tokens,
-            user_message=clip(user_message, 2000),
+            user_message=user_message,
         )
         self.log_memory("request_start")
         self.record(MessageEntry(role="user", content=user_message, created_at=now()))
@@ -398,7 +555,7 @@ class MiniAgent:
                     {"name": bad.name, "error": bad.error}
                     for bad in response.malformed_tool_calls
                 ],
-                content=clip(response.content, 2000),
+                content=response.content,
             )
 
             if response.malformed_tool_calls:
@@ -408,7 +565,7 @@ class MiniAgent:
                         attempt=attempts,
                         name=bad.name,
                         error=bad.error,
-                        raw_args=clip(bad.raw_args, 500),
+                        raw_args=bad.raw_args,
                     )
                     self._emit(
                         on_event,
@@ -441,7 +598,7 @@ class MiniAgent:
                         "tool_result",
                         name=name,
                         step=tool_steps,
-                        result=clip(result, 2000),
+                        result=result,
                     )
                     self._emit(
                         on_event,
@@ -494,14 +651,14 @@ class MiniAgent:
                 continue
 
             self.record(MessageEntry(role="assistant", content=final, created_at=now()))
-            self.remember(memory.notes, clip(final, 220), 5)
+            self.remember(memory.notes, final, 5)
             self.log_memory("final")
             self.logger.log(
                 "final",
                 reason="answer",
                 tool_steps=tool_steps,
                 attempts=attempts,
-                final=clip(final, 2000),
+                final=final,
             )
             self._emit(on_event, "final", text=final)
             return final
@@ -518,7 +675,7 @@ class MiniAgent:
             reason=reason,
             tool_steps=tool_steps,
             attempts=attempts,
-            final=clip(final, 2000),
+            final=final,
         )
         self._emit(on_event, "final", text=final, reason=reason)
         return final
@@ -534,7 +691,7 @@ class MiniAgent:
         Stored with role "system" so the correction does not appear in the
         model's own (assistant) voice, which small models tend to imitate.
         """
-        self.logger.log("retry", attempt=attempts, notice=clip(notice, 500))
+        self.logger.log("retry", attempt=attempts, notice=notice)
         self._emit(on_event, "retry", notice=notice)
         self.record(MessageEntry(role="system", content=notice, created_at=now()))
 

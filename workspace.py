@@ -1,7 +1,7 @@
 import subprocess
 from pathlib import Path
 
-from utils import DOC_NAMES, clip
+from utils import DOC_NAMES
 
 
 class WorkspaceContext:
@@ -51,9 +51,7 @@ class WorkspaceContext:
                 key = str(path.relative_to(repo_root))
                 if key in docs:
                     continue
-                docs[key] = clip(
-                    path.read_text(encoding="utf-8", errors="replace"), 1200
-                )
+                docs[key] = path.read_text(encoding="utf-8", errors="replace")
 
         return cls(
             cwd=str(cwd),
@@ -66,7 +64,7 @@ class WorkspaceContext:
                 )
                 or "origin/main"
             ).removeprefix("origin/"),
-            status=clip(git(["status", "--short"], "clean") or "clean", 1500),
+            status=git(["status", "--short"], "clean") or "clean",
             recent_commits=[
                 line for line in git(["log", "--oneline", "-5"]).splitlines() if line
             ],

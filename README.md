@@ -19,7 +19,8 @@ diff the two runs to see what the change actually did.
 | --- | --- |
 | `main.py` | CLI entry point: argument parsing, headless/TUI dispatch |
 | `agent.py` | The agent loop: builds prompts, calls the model, runs tools, tracks memory |
-| `tools.py` | Tool catalog, JSON-schema generation, approval gating, path sandboxing |
+| `tools.py` | Tool catalog, JSON-schema generation, approval gating, path sandboxing, write safety |
+| `tool_support.py` | Repairing malformed tool calls, tool/argument aliases, patch diagnostics, output shaping |
 | `model_clients.py` | OpenAI-compatible client for `llama-server`, tool-call parsing |
 | `app_types.py` | Dataclasses shared across the codebase (history entries, tool calls, session) |
 | `workspace.py` | One-shot collection of repo facts (branch, status, recent commits, project docs) |
@@ -27,7 +28,7 @@ diff the two runs to see what the change actually did.
 | `agent_logging.py` | Structured JSONL logger used everywhere in the loop |
 | `log_viewer.py` | Standalone CLI to pretty-print and filter a run's JSONL log |
 | `tui.py` | Textual-based interactive front-end |
-| `utils.py` | Shared constants and helpers: clipping limits, ignored paths, formatting |
+| `utils.py` | Shared constants and helpers: context budgets, tool profiles, ignored paths, formatting |
 
 &nbsp;
 
@@ -44,14 +45,26 @@ diff the two runs to see what the change actually did.
   `user` / `assistant` / `tool` turns rebuilt from the session transcript
   on every step. Tool calls and their results are paired using
   `tool_call_id`, matching the format most tool-calling models are trained
-  on. Older turns are clipped harder than the last few, and superseded
-  `read_file` results are dropped so re-reading a file doesn't bloat the
-  context with stale content.
+  on. Tool output is never truncated: content reaches the model whole or is
+  dropped whole. Reads that have gone out of date (a later read covering the
+  same lines, or a `write_file` that replaced the file) are dropped, and when
+  old turns have to go to fit the context the model is told what it can no
+  longer see (`agent.py: _eviction_notice`).
 - **Tools** (`tools.py`) — the model acts only through named, schema-checked
-  tools (see the table below). Arguments are validated and loosely-typed
-  values are coerced (e.g. `"20"` for an int) before a tool runs. Every
-  path argument is resolved and checked against the workspace root so a
-  tool can't escape it.
+  tools (see the table below). Every path argument is resolved and checked
+  against the workspace root so a tool can't escape it.
+- **Call repair** (`tool_support.py`) — a call whose *shape* is wrong is
+  repaired instead of rejected: invented tool names are mapped onto real ones
+  (`cat` → `read_file`), alias arguments are renamed (`file_path` → `path`),
+  `{"arguments": {...}}` envelopes are unwrapped, loose scalars are coerced
+  (`"20"` for an int), content sent as a list of lines is joined, and pasted
+  line-number prefixes and code fences are stripped. Every repair is reported
+  back to the model so it learns the right shape, and logged as
+  `tool_args_normalized`.
+- **Write safety** (`tools.py: ToolRegistry`) — every write is preceded by an
+  automatic backup under `.harness-lab/backups/`, followed by a syntax check
+  of the result (Python and JSON), and `write_file` refuses to replace an
+  existing file this session has never read (disable with `--no-write-guard`).
 - **Approval** (`tools.py: ToolRegistry._approve`) — tools marked `risky`
   (shell, file writes) are gated by `--approval ask|auto|never`; the TUI
   routes `ask` through a modal dialog instead of a terminal prompt.
@@ -172,8 +185,9 @@ For a concrete usage example, see [EXAMPLE.md](EXAMPLE.md).
 
 ## Approval modes
 
-Risky tools — `run_shell`, `write_file`, `patch_file`, `append_file` — are
-gated by approval.
+Risky tools — `run_shell`, `run_tests`, `write_file`, `patch_file`,
+`append_file`, `replace_lines`, `move_file`, `delete_file`, `revert_file` —
+are gated by approval.
 
 - `--approval ask`
   prompts before risky actions (default and recommended)
@@ -269,27 +283,53 @@ python main.py --help
 
 ## Tools
 
-| Tool | Risky | Purpose |
-| --- | --- | --- |
-| `list_files` | no | List entries in a workspace directory |
-| `read_file` | no | Read a UTF-8 file by 1-based line range |
-| `search` | no | Search the workspace with `rg` (falls back to a plain substring scan if `rg` isn't installed) |
-| `run_shell` | yes | Run a shell command at the repo root, with a timeout |
-| `write_file` | yes | Write/replace a file's full content |
-| `patch_file` | yes | Replace one exact, unique text block in a file |
-| `append_file` | yes | Append text to a file, creating it if missing; used to build long files across multiple calls |
-| `delegate` | no | Hand a bounded, read-only investigation to a child agent |
+Which tools the model sees is set by `--tools minimal|standard|full`. More
+tools give the model more reach but cost accuracy on small models, so the
+profile is an experiment knob rather than a fixed answer.
+
+| Tool | Profile | Risky | Purpose |
+| --- | --- | --- | --- |
+| `list_files` | minimal | no | List a workspace directory, with an optional `depth` |
+| `read_file` | minimal | no | Read a whole UTF-8 file, never clipped |
+| `read_file_range` | minimal | no | Read part of a file by 1-based line range |
+| `search` | minimal | no | Search file contents with `rg` (falls back to a substring scan if `rg` isn't installed) |
+| `run_shell` | minimal | yes | Run a shell command at the repo root, with a timeout |
+| `write_file` | minimal | yes | Write/replace a file's full content |
+| `patch_file` | minimal | yes | Replace one exact, unique text block in a file |
+| `append_file` | minimal | yes | Append text to a file, creating it if missing; used to build long files across multiple calls |
+| `outline_file` | standard | no | List a file's classes and functions with line numbers |
+| `find_files` | standard | no | Find files by name or glob |
+| `replace_lines` | standard | yes | Replace a range of lines by number |
+| `git_status` | standard | no | Show which files have been modified |
+| `git_diff` | standard | no | Show uncommitted changes |
+| `run_tests` | standard | yes | Detect and run the project's test suite |
+| `move_file` | standard | yes | Move or rename a file |
+| `delete_file` | standard | yes | Delete a file (backed up first) |
+| `revert_file` | full | yes | Restore a file from its most recent automatic backup |
+| `delegate` | full | no | Hand a bounded, read-only investigation to a child agent |
 
 Notes:
 
 - All path arguments are resolved relative to the repo root and rejected if
-  they resolve outside it.
+  they resolve outside it. Writes into `.git/` and `.harness-lab/` are
+  refused even though they are inside the root.
 - The model is limited to one tool call per step (`parallel_tool_calls`
   disabled), so each tool result is fed back before the next decision is
   made.
-- If the model repeats the exact same tool call twice in a row, the tool
-  registry short-circuits it with an error instead of running it again, to
-  break simple loops.
+- Working on a file too large to hold in context is meant to go
+  `outline_file` → `read_file_range` → `replace_lines`: every byte the model
+  sees is complete, and it never needs the whole file at once.
+- A tool call identical to the one before it is short-circuited with an
+  error, as is an A-B-A-B alternation between two calls that aren't making
+  progress. Tools whose output legitimately changes between calls
+  (`run_shell`, `run_tests`, `git_status`, `git_diff`) are exempt from the
+  alternation check, since re-running tests after an edit is the point.
+- Failures answer with what to do next: an ambiguous `patch_file` lists the
+  line numbers it matched, a missed one prints the closest real text in the
+  file, and a missing path suggests files that do exist.
+- `patch_file` retries a failed match without pasted line numbers and then
+  ignoring indentation before giving up, so the two most common ways a small
+  model mangles a copied block still land.
 - Tool schemas are generated from a compact `"type[=default]|description"`
   spec per argument (see `tools.py: ToolRegistry._field_schema`); adding a
   new tool is a matter of writing a function and decorating it with
@@ -314,6 +354,14 @@ and exchanges, in order:
 - `llm_request` / `llm_response` / `llm_continuation` — the raw messages,
   model params, and completions exchanged with the `llama-server` backend
 - `tool_call` / `tool_result` — tool invocations and their output
+- `tool_outcome` — how each call ended (`ok`, `arg_error`, `not_found`,
+  `no_match`, `denied`, `guard_blocked`, `repeated`, `unknown_tool`), which
+  is what makes a per-tool failure rate measurable across runs
+- `tool_args_normalized` / `tool_name_recovered` — calls that arrived
+  malformed and were repaired, and what was wrong with them
+- `context_budget` — the measured prompt overhead and the resulting history
+  budget for the chosen `--tools` profile
+- `history_window` — turns dropped to fit the context, and what they were
 - `model_output` / `retry` / `malformed_tool_call` — raw model output and
   how it was parsed, plus any corrective notice sent back to the model
 
@@ -343,13 +391,22 @@ output quality, here's where each piece lives:
 - **System prompt / rules** — `agent.py: MiniAgent.build_prefix`
 - **How much workspace context is exposed** —
   `workspace.py: WorkspaceContext.build/text`, and `DOC_NAMES` in `utils.py`
-- **Tool set** — add, remove, or reword tools in `tools.py`
-  (`@agent_tool(...)`); a worse or better tool description/schema/example
-  directly changes how reliably a small model calls it correctly
-- **Context/memory budget** — `MAX_HISTORY` / `MAX_TOOL_OUTPUT` in
-  `utils.py`, the stale-read pruning and per-turn clip limits in
-  `agent.py: build_messages`, and the file/note retention limits in
-  `agent.py: note_tool`
+- **Tool set** — `--tools minimal|standard|full`, or add, remove and reword
+  tools in `tools.py` (`@agent_tool(...)`); a worse or better tool
+  description/schema/example directly changes how reliably a small model
+  calls it correctly
+- **Call repair** — the alias tables and repair rules in `tool_support.py`;
+  turning one off shows how much of a model's apparent competence comes from
+  the harness rather than the model
+- **Write friction** — `--no-write-guard` removes the read-before-overwrite
+  requirement
+- **Context/memory budget** — the history budget is derived from the model's
+  real `n_ctx` in `agent.py: MiniAgent.__init__` (see `context_chars` in
+  `utils.py`), spent by dropping whole turns in `_fit_history_budget`, and
+  bounded by the stale-read rules in `_stale_read_indices`; file/note
+  retention lives in `agent.py: note_tool`
+- **Noisy-output budget** — `--max-tool-output` (0 disables it); applies to
+  shell and search output only, never to file reads
 - **Generation and step budget** — `--max-steps`, `--max-new-tokens`,
   `--temperature`, `--top-p`
 - **Friction on risky actions** — `--approval`

@@ -167,6 +167,7 @@ class LlamaCppModelClient:
                 finish_reason == "length"
                 and not tool_calls
                 and not malformed_tool_calls
+                and chunk
             ):
                 messages = messages + [
                     {"role": "assistant", "content": assistant_message}

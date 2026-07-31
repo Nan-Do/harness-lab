@@ -31,8 +31,15 @@ py-modules = [
     "main",
     "model_clients",
     "session",
+    "tool_support",
     "tools",
     "tui",
     "utils",
     "workspace",
 ]
+
+[tool.pytest.ini_options]
+# The harness is a set of top-level modules, so tests import them from the
+# repo root rather than from an installed package.
+pythonpath = ["."]
+testpaths = ["tests"]
