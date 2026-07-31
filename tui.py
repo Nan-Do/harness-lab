@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 from time import monotonic
-from typing import Any, Dict
+from typing import Any
 
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -20,7 +20,7 @@ from textual.widgets import Button, Footer, Header, Input, RichLog, Static
 
 from agent import MiniAgent
 from tool_support import size_note, split_args, streaming_body
-from utils import HELP_DETAILS, WELCOME_ART
+from utils import HELP_DETAILS, APP_NAME
 
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 # Repainting on every token would spend more time in the UI than in the model,
@@ -62,7 +62,7 @@ class ApprovalScreen(ModalScreen[bool]):
         Binding("n,escape", "deny", "Deny"),
     ]
 
-    def __init__(self, name: str, args: Dict[str, Any]) -> None:
+    def __init__(self, name: str, args: dict[str, Any]) -> None:
         super().__init__()
         self._name = name
         self._args = args
@@ -229,12 +229,12 @@ class MiniAgentApp(App):
             self._refresh_status()
 
     def _write_banner(self) -> None:
-        art = "\n".join(WELCOME_ART)
+        app = "\n".join(APP_NAME)
         self._logview.write(
             Panel(
                 Text.assemble(
-                    (art + "\n\n", "cyan"),
-                    ("Harness Lab\n", "bold cyan"),
+                    (app + "\n\n", "cyan"),
+                    ("Status: \n", "bold cyan"),
                     (f"workspace  {self.agent.workspace.cwd}\n", ""),
                     (f"model      {self.model}\n", ""),
                     (f"endpoint   {self.endpoint}\n", ""),
@@ -242,17 +242,17 @@ class MiniAgentApp(App):
                     ("\nType a request and press Enter. /help lists commands.", "dim"),
                 ),
                 border_style="cyan",
-                title="welcome",
+                title="Welcome",
             )
         )
 
     def _write_user(self, text: str) -> None:
-        self._logview.write(Panel(Text(text), title="you", border_style="cyan"))
+        self._logview.write(Panel(Text(text), title="You", border_style="cyan"))
 
     def _write_agent(self, text: str) -> None:
-        self._logview.write(Panel(Markdown(text), title="agent", border_style="green"))
+        self._logview.write(Panel(Markdown(text), title="Agent", border_style="green"))
 
-    def _write_tool_call(self, name: str, args: Dict[str, Any]) -> None:
+    def _write_tool_call(self, name: str, args: dict[str, Any]) -> None:
         """Announce the call on one line, then show any body it carries.
 
         The body is what the user is about to approve, so it is rendered as
@@ -349,7 +349,7 @@ class MiniAgentApp(App):
             self._logview.write(
                 Panel(
                     Markdown(text),
-                    title="agent · thinking",
+                    title="Agent · Thinking",
                     border_style="dim green",
                     title_align="left",
                 )
@@ -382,10 +382,14 @@ class MiniAgentApp(App):
         if command in {"/exit", "/quit"}:
             self.exit()
         elif command == "/help":
-            self._logview.write(Panel(Text(HELP_DETAILS), title="help", border_style="dim"))
+            self._logview.write(
+                Panel(Text(HELP_DETAILS), title="help", border_style="dim")
+            )
         elif command == "/memory":
             self._logview.write(
-                Panel(Text(self.agent.memory_text()), title="memory", border_style="dim")
+                Panel(
+                    Text(self.agent.memory_text()), title="memory", border_style="dim"
+                )
             )
         elif command == "/session":
             self._write_notice(self.agent.session_path, style="cyan")
@@ -483,10 +487,10 @@ class MiniAgentApp(App):
         self._stream_painted = monotonic()
         self.call_from_thread(self._render_stream)
 
-    def _approval_callback(self, name: str, args: Dict[str, Any]) -> bool:
+    def _approval_callback(self, name: str, args: dict[str, Any]) -> bool:
         """Blocking approval prompt invoked from the agent worker thread."""
         done = threading.Event()
-        result: Dict[str, bool] = {"approved": False}
+        result: dict[str, bool] = {"approved": False}
 
         def request() -> None:
             def on_result(approved: bool | None) -> None:

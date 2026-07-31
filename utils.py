@@ -3,13 +3,12 @@ from datetime import datetime, timezone
 
 DOC_NAMES = ("AGENTS.md", "README.md", "pyproject.toml", "package.json")
 HELP_TEXT = "/help, /memory, /session, /log, /reset, /clear, /exit"
-WELCOME_ART = (
-    "/\\     /\\\\",
-    "{  `---'  }",
-    "{  O   O  }",
-    "~~>  V  <~~",
-    "\\\\  \\|/  /",
-    "`-----'__",
+APP_NAME = (
+    r" _   _                                          _          _     ",
+    r"| | | | __ _ _ __ _ __   ___  ___ ___          | |    __ _| |__  ",
+    r"| |_| |/ _` | '__| '_ \ / _ \/ __/ __|  _____  | |   / _` | '_ \ ",
+    r"|  _  | (_| | |  | | | |  __/\__ \__ \ |_____| | |__| (_| | |_) |",
+    r"|_| |_|\__,_|_|  |_| |_|\___||___/___/         |_____\__,_|_.__/ ",
 )
 HELP_DETAILS = "\n".join(
     [
