@@ -163,12 +163,16 @@ class MiniAgentApp(App):
         model: str,
         context: int,
         endpoint: str,
+        prompt: str = "",
     ) -> None:
         super().__init__()
         self.agent = agent
         self.model = model
         self.context = context
         self.endpoint = endpoint
+        # A prompt given on the command line starts the session off; the TUI
+        # then stays open for follow-ups instead of exiting like headless.
+        self.initial_prompt = prompt.strip()
         self._busy = False
         self._spinner_index = 0
         # Written from the agent worker thread, rendered from the UI thread.
@@ -194,6 +198,10 @@ class MiniAgentApp(App):
         self.set_interval(0.1, self._tick_spinner)
         self._write_banner()
         self.query_one("#prompt", Input).focus()
+        if self.initial_prompt:
+            # After the first paint, so the banner is up and an approval modal
+            # has a running app to attach to before the agent can ask for one.
+            self.call_after_refresh(self._submit, self.initial_prompt)
 
     # --- Rendering helpers -------------------------------------------------
 
@@ -352,9 +360,17 @@ class MiniAgentApp(App):
     @on(Input.Submitted, "#prompt")
     def _on_submit(self, event: Input.Submitted) -> None:
         text = event.value.strip()
+        event.input.value = ""
+        self._submit(text)
+
+    def _submit(self, text: str) -> None:
+        """Run one request or command, however it was asked for.
+
+        Typing it and passing it on the command line go through here alike, so
+        a prompt given at startup behaves exactly like the first thing typed.
+        """
         if not text or self._busy:
             return
-        event.input.value = ""
         if text.startswith("/"):
             self._handle_command(text)
             return
@@ -499,6 +515,18 @@ class MiniAgentApp(App):
         self._refresh_status()
 
 
-def run_tui(agent: MiniAgent, model: str, context: int, endpoint: str) -> int:
-    MiniAgentApp(agent, model=model, context=context, endpoint=endpoint).run()
+def run_tui(
+    agent: MiniAgent,
+    model: str,
+    context: int,
+    endpoint: str,
+    prompt: str = "",
+) -> int:
+    MiniAgentApp(
+        agent,
+        model=model,
+        context=context,
+        endpoint=endpoint,
+        prompt=prompt,
+    ).run()
     return 0

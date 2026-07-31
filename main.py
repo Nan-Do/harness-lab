@@ -75,6 +75,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="auto",
         help=(
             "Interface mode. 'tui' launches the interactive Textual UI, "
+            "running the command-line prompt first if one was given, "
             "'headless' runs a single request and prints the answer, "
             "'plain' prints the whole interaction (streamed model text, tool "
             "calls, bodies, results) as plain text, "
@@ -238,6 +239,7 @@ def main() -> int:
         model=agent.model_client.model,
         context=agent.model_client.ctx,
         endpoint=endpoint,
+        prompt=prompt,
     )
 
 

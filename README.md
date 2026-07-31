@@ -177,6 +177,14 @@ interactive UI, `--mode headless` always runs one request and exits, and
 `--mode plain` runs it while printing the whole interaction as text (see
 [Plain mode](#plain-mode)).
 
+A prompt given on the command line is never dropped: whichever mode is chosen
+starts with it. In the TUI it runs as the first request and the session then
+stays open for follow-ups, which is the whole difference from headless mode:
+
+```bash
+uv run harness-lab --mode tui "add a docstring to calc.py"
+```
+
 Without `uv`, run the script directly:
 
 ```bash
@@ -290,7 +298,8 @@ Without `uv`:
 python main.py --help
 ```
 
-- `prompt` — optional one-shot prompt words; if present, runs headless
+- `prompt` — optional prompt words; on their own they run a headless one-shot,
+  and with `--mode tui` / `--mode plain` they start that session instead
 - `--mode` — `auto` (default), `tui`, `headless`, or `plain`
 - `--cwd` — workspace directory the agent inspects and modifies; default `.`
 - `--model` — model name/id requested from `llama-server`; if it doesn't
