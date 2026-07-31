@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+from time import monotonic
 from typing import Any, Dict
 
 from rich.markdown import Markdown
@@ -21,6 +22,12 @@ from agent import MiniAgent
 from utils import HELP_DETAILS, WELCOME_ART
 
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+# Repainting on every token would spend more time in the UI than in the model,
+# so streamed text lands in a buffer and the live view catches up on a tick.
+_STREAM_REFRESH = 0.05
+# The live view is a peephole onto text still being written; it keeps the tail
+# in sight and lets the finished turn land in the log as a whole block.
+_STREAM_TAIL_LINES = 8
 
 
 def _format_args(args: Dict[str, Any]) -> str:
@@ -82,6 +89,15 @@ class MiniAgentApp(App):
         padding: 0 1;
         background: $surface;
     }
+    #stream {
+        display: none;
+        height: auto;
+        max-height: 10;
+        padding: 0 1;
+        color: $text-muted;
+        background: $surface;
+        border-left: outer $success 50%;
+    }
     #status {
         height: 1;
         padding: 0 1;
@@ -132,10 +148,14 @@ class MiniAgentApp(App):
         self.endpoint = endpoint
         self._busy = False
         self._spinner_index = 0
+        # Written from the agent worker thread, rendered from the UI thread.
+        self._stream_text = ""
+        self._stream_painted = 0.0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield RichLog(id="log", wrap=True, markup=True, highlight=False)
+        yield Static("", id="stream")
         yield Static(self._status_text(), id="status")
         yield Input(placeholder="Ask the agent…  (/help for commands)", id="prompt")
         yield Footer()
@@ -223,6 +243,47 @@ class MiniAgentApp(App):
     def _write_notice(self, text: str, style: str = "yellow") -> None:
         self._logview.write(Text(text, style=style))
 
+    # --- Streaming live view -----------------------------------------------
+
+    @property
+    def _streamview(self) -> Static:
+        return self.query_one("#stream", Static)
+
+    def _render_stream(self) -> None:
+        """Repaint the live view with the tail of the text so far."""
+        text = self._stream_text
+        if not text.strip():
+            self._streamview.display = False
+            return
+        tail = "\n".join(text.splitlines()[-_STREAM_TAIL_LINES:])
+        self._streamview.update(Text(tail))
+        self._streamview.display = True
+
+    def _reset_stream(self) -> None:
+        self._stream_text = ""
+        self._streamview.update("")
+        self._streamview.display = False
+
+    def _end_stream(self, commit: bool) -> None:
+        """Close out the live view once the model turn is decided.
+
+        A turn that ends in a tool call is the model thinking out loud on its
+        way to acting; `commit` keeps that text in the log so the reasoning
+        survives after the live view is gone. The final answer is committed by
+        `_write_agent` instead, so it is not written twice.
+        """
+        text = self._stream_text.strip()
+        self._reset_stream()
+        if commit and text:
+            self._logview.write(
+                Panel(
+                    Markdown(text),
+                    title="agent · thinking",
+                    border_style="dim green",
+                    title_align="left",
+                )
+            )
+
     # --- Event handling ----------------------------------------------------
 
     @on(Input.Submitted, "#prompt")
@@ -273,11 +334,15 @@ class MiniAgentApp(App):
             self.agent.ask(text, on_event=self._on_agent_event)
         except Exception as exc:  # network/runtime failures from llama-server
             self.agent.logger.log("repl_error", mode="tui", error=str(exc))
+            # Keep whatever was streamed before the failure: on a mid-stream
+            # error it is the only record of how far the model got.
+            self.call_from_thread(self._end_stream, True)
             self.call_from_thread(self._write_notice, f"error: {exc}", "red")
         finally:
             self.call_from_thread(self._finish_task)
 
     def _finish_task(self) -> None:
+        self._reset_stream()
         self._busy = False
         self._refresh_status()
         prompt = self.query_one("#prompt", Input)
@@ -286,7 +351,12 @@ class MiniAgentApp(App):
 
     def _on_agent_event(self, event_type: str, **data: Any) -> None:
         """Called from the worker thread; marshal back onto the UI thread."""
-        if event_type == "tool_call":
+        if event_type == "assistant_delta":
+            self._on_stream_delta(data.get("text", ""))
+        elif event_type == "thinking":
+            self.call_from_thread(self._reset_stream)
+        elif event_type == "tool_call":
+            self.call_from_thread(self._end_stream, True)
             self.call_from_thread(
                 self._write_tool_call, data["name"], data.get("args", {})
             )
@@ -295,6 +365,7 @@ class MiniAgentApp(App):
                 self._write_tool_result, data["name"], data.get("result", "")
             )
         elif event_type == "malformed_tool_call":
+            self.call_from_thread(self._end_stream, True)
             self.call_from_thread(
                 self._write_notice,
                 f"malformed tool call: {data.get('name') or 'unknown'} "
@@ -302,11 +373,28 @@ class MiniAgentApp(App):
                 "yellow",
             )
         elif event_type == "retry":
+            self.call_from_thread(self._end_stream, True)
             self.call_from_thread(
                 self._write_notice, "retrying: " + data.get("notice", ""), "yellow"
             )
         elif event_type == "final":
+            self.call_from_thread(self._end_stream, False)
             self.call_from_thread(self._write_agent, data.get("text", ""))
+
+    def _on_stream_delta(self, text: str) -> None:
+        """Buffer streamed text on the worker thread, repainting on a tick.
+
+        Every repaint is a cross-thread hop, so tokens accumulate between
+        them; whatever the last hop missed is picked up when the turn ends.
+        """
+        if not text:
+            return
+        self._stream_text += text
+        elapsed = monotonic() - self._stream_painted
+        if elapsed < _STREAM_REFRESH:
+            return
+        self._stream_painted = monotonic()
+        self.call_from_thread(self._render_stream)
 
     def _approval_callback(self, name: str, args: Dict[str, Any]) -> bool:
         """Blocking approval prompt invoked from the agent worker thread."""
@@ -327,11 +415,13 @@ class MiniAgentApp(App):
     # --- Actions -----------------------------------------------------------
 
     def action_clear_log(self) -> None:
+        self._reset_stream()
         self._logview.clear()
         self._write_banner()
 
     def action_reset_session(self) -> None:
         self.agent.reset()
+        self._reset_stream()
         self._logview.clear()
         self._write_banner()
         self._write_notice("session reset", style="green")

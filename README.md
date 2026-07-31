@@ -21,7 +21,7 @@ diff the two runs to see what the change actually did.
 | `agent.py` | The agent loop: builds prompts, calls the model, runs tools, tracks memory |
 | `tools.py` | Tool catalog, JSON-schema generation, approval gating, path sandboxing, write safety |
 | `tool_support.py` | Repairing malformed tool calls, tool/argument aliases, patch diagnostics, output shaping |
-| `model_clients.py` | OpenAI-compatible client for `llama-server`, tool-call parsing |
+| `model_clients.py` | OpenAI-compatible client for `llama-server`: streamed and whole completions, tool-call parsing |
 | `app_types.py` | Dataclasses shared across the codebase (history entries, tool calls, session) |
 | `workspace.py` | One-shot collection of repo facts (branch, status, recent commits, project docs) |
 | `session.py` | Loads/saves session transcripts as JSON under `.harness-lab/sessions/` |
@@ -50,6 +50,12 @@ diff the two runs to see what the change actually did.
   same lines, or a `write_file` that replaced the file) are dropped, and when
   old turns have to go to fit the context the model is told what it can no
   longer see (`agent.py: _eviction_notice`).
+- **Model transport** (`model_clients.py`) — an OpenAI-compatible client
+  against `llama-server`. With `--stream` (default) the response is consumed
+  as it is generated and text is handed to the front-end token by token;
+  otherwise it is read in one piece. Either way the agent loop only sees a
+  finished turn, so streaming changes when you see the answer, not how it is
+  decided.
 - **Tools** (`tools.py`) — the model acts only through named, schema-checked
   tools (see the table below). Every path argument is resolved and checked
   against the workspace root so a tool can't escape it.
@@ -268,6 +274,9 @@ python main.py --help
 - `--host` — `llama-server` host address; default `127.0.0.1`
 - `--port` — `llama-server` port; default `8080`
 - `--llama-timeout` — request timeout in seconds; default `300`
+- `--stream` / `--no-stream` — stream tokens from `llama-server` as they are
+  generated instead of waiting for the whole completion; default on. See
+  [Streaming](#streaming)
 - `--resume` — resume a saved session by id, or `latest`; default: start a
   new session
 - `--approval` — `ask`, `auto`, or `never`; default `ask`
@@ -278,6 +287,49 @@ python main.py --help
 - `--log-dir` — directory for JSONL run logs; default
   `<workspace>/.harness-lab/logs`
 - `--no-log` — disables structured logging entirely
+
+&nbsp;
+
+## Streaming
+
+By default the harness streams from `llama-server`: the response is consumed
+as it is generated instead of arriving in one piece when generation ends. On
+a small local model producing a few hundred tokens a step, that is the
+difference between a blank screen for several seconds and watching the answer
+being written.
+
+In the TUI, streamed text appears in a live view above the status bar while
+it arrives. What happens to it when the turn ends depends on how the model
+ended it:
+
+- a **final answer** is rendered as the usual `agent` panel in the log
+- text that preceded a **tool call** (the model thinking out loud on its way
+  to acting) is committed to the log as an `agent · thinking` panel, so the
+  reasoning stays readable after the live view is gone
+- text cut short by an **error** mid-generation is kept too — it is the only
+  record of how far the model got
+
+Headless mode is unchanged: it prints the final answer once, so piping the
+output stays scriptable.
+
+Streaming is a view onto generation, not a change to the loop. The agent
+still decides on a whole turn: tool calls are reassembled from their
+fragments and only run once the stream is complete, and a turn that stops at
+the token limit is continued exactly as before (the continuation streams
+too). Running the same prompt with and without `--stream` should produce the
+same `tool_call` and `final` events.
+
+Use `--no-stream` to go back to one-shot completions — worth trying if a
+backend's streamed tool calls arrive malformed, since it isolates whether a
+failure comes from generation or from stream reassembly.
+
+Notes:
+
+- `llm_request` and `llm_response` log lines carry a `stream` field, so a run
+  log records which transport produced it.
+- Token counts for a streamed round come from `stream_options:
+  {"include_usage": true}`; a server that doesn't send that final usage chunk
+  logs `usage: null` while everything else keeps working.
 
 &nbsp;
 
@@ -352,7 +404,8 @@ and exchanges, in order:
 - `prompt_built` — the message roles and character counts sent to the model
   for that step
 - `llm_request` / `llm_response` / `llm_continuation` — the raw messages,
-  model params, and completions exchanged with the `llama-server` backend
+  model params, and completions exchanged with the `llama-server` backend,
+  including whether the round was streamed
 - `tool_call` / `tool_result` — tool invocations and their output
 - `tool_outcome` — how each call ended (`ok`, `arg_error`, `not_found`,
   `no_match`, `denied`, `guard_blocked`, `repeated`, `unknown_tool`), which
@@ -409,6 +462,8 @@ output quality, here's where each piece lives:
   shell and search output only, never to file reads
 - **Generation and step budget** — `--max-steps`, `--max-new-tokens`,
   `--temperature`, `--top-p`
+- **Transport** — `--stream` / `--no-stream`; changes when output is visible,
+  and is worth flipping when a backend's streamed tool calls look suspect
 - **Friction on risky actions** — `--approval`
 
 Since every run is fully logged, a natural workflow is: change one of the

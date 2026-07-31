@@ -505,6 +505,22 @@ class MiniAgent:
             # The UI callback must never break the agent loop.
             self.logger.log("event_callback_error", event_type=event_type)
 
+    def _delta_emitter(
+        self: Self, on_event: Callable[..., None] | None
+    ) -> Callable[[str], None] | None:
+        """Bridge streamed model text to the front-end as `assistant_delta`.
+
+        Returns None when nobody is listening, so a headless or delegated run
+        doesn't pay for a callback per token.
+        """
+        if on_event is None:
+            return None
+
+        def emit(text: str) -> None:
+            self._emit(on_event, "assistant_delta", text=text)
+
+        return emit
+
     def ask(
         self: Self,
         user_message: str,
@@ -545,6 +561,7 @@ class MiniAgent:
                 messages,
                 self.max_new_tokens,
                 tools=self.tools.schemas(),
+                on_delta=self._delta_emitter(on_event),
             )
             self.logger.log(
                 "model_output",

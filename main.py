@@ -32,6 +32,7 @@ def build_agent(args: argparse.Namespace) -> MiniAgent:
         top_p=args.top_p,
         timeout=args.llama_timeout,
         logger=logger,
+        stream=args.stream,
     )
     options = dict(
         approval_policy=args.approval,
@@ -93,6 +94,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=300,
         help="Llama request timeout in seconds.",
+    )
+    parser.add_argument(
+        "--stream",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Stream tokens from llama-server as they are generated; the TUI "
+            "shows the answer being written instead of waiting for the whole "
+            "response. Use --no-stream to request completions in one piece."
+        ),
     )
     parser.add_argument(
         "--resume", default=None, help="Session id to resume or 'latest'."
