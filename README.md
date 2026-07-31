@@ -17,7 +17,7 @@ diff the two runs to see what the change actually did.
 
 | File | Role |
 | --- | --- |
-| `main.py` | CLI entry point: argument parsing, headless/TUI dispatch |
+| `main.py` | CLI entry point: argument parsing, front-end dispatch |
 | `agent.py` | The agent loop: builds prompts, calls the model, runs tools, tracks memory |
 | `tools.py` | Tool catalog, JSON-schema generation, approval gating, path sandboxing, write safety |
 | `tool_support.py` | Repairing malformed tool calls, tool/argument aliases, patch diagnostics, output shaping |
@@ -28,6 +28,7 @@ diff the two runs to see what the change actually did.
 | `agent_logging.py` | Structured JSONL logger used everywhere in the loop |
 | `log_viewer.py` | Standalone CLI to pretty-print and filter a run's JSONL log |
 | `tui.py` | Textual-based interactive front-end |
+| `plain.py` | Plain-text front-end: the whole interaction as text on stdout |
 | `utils.py` | Shared constants and helpers: context budgets, tool profiles, ignored paths, formatting |
 
 &nbsp;
@@ -172,7 +173,9 @@ echo "summarize README.md" | uv run harness-lab
 ```
 
 `--mode` overrides this auto-detection: `--mode tui` always launches the
-interactive UI, `--mode headless` always runs one request and exits.
+interactive UI, `--mode headless` always runs one request and exits, and
+`--mode plain` runs it while printing the whole interaction as text (see
+[Plain mode](#plain-mode)).
 
 Without `uv`, run the script directly:
 
@@ -210,6 +213,28 @@ Example:
 uv run harness-lab --approval auto
 ```
 
+What the prompt shows is deliberately not the payload. A write is answered in
+two parts: the file itself goes to the conversation first — streamed as the
+model writes it, so it is already on screen by the time the call completes —
+and the question that follows names the tool, its short arguments, and how big
+the body is:
+
+```text
+  ⋯ write_file
+def greet(name):
+    """Return a greeting string for the given name."""
+    return f"Hello, {name}!"
+
+  → write_file path=greet.py
+approve write_file path=greet.py · content: 3 lines, 101 B? [y/N]
+```
+
+The split is by size, not by argument name: anything short enough to read at a
+glance (a path, a line range, a shell command) stays on the question, and
+anything longer or spanning lines is shown as a block and summarized in the
+prompt. A 500-line file and a one-line command therefore both produce a
+readable dialog.
+
 &nbsp;
 
 ## Resume sessions
@@ -236,9 +261,9 @@ uv run harness-lab --resume 20260401-144025-2dd0aa
 
 ## Interactive commands
 
-These slash commands are handled by the TUI directly instead of being sent
-to the model as a task (headless mode runs a single request and has no
-command handling).
+These slash commands are handled by the TUI (and by plain mode's read-ask
+loop) directly instead of being sent to the model as a task. Headless mode
+runs a single request and has no command handling.
 
 - `/help` — shows the list of available interactive commands
 - `/memory` — prints the distilled session memory: current task, tracked
@@ -266,7 +291,7 @@ python main.py --help
 ```
 
 - `prompt` — optional one-shot prompt words; if present, runs headless
-- `--mode` — `auto` (default), `tui`, or `headless`
+- `--mode` — `auto` (default), `tui`, `headless`, or `plain`
 - `--cwd` — workspace directory the agent inspects and modifies; default `.`
 - `--model` — model name/id requested from `llama-server`; if it doesn't
   match an available model, the server's first reported model is used
@@ -309,8 +334,16 @@ ended it:
 - text cut short by an **error** mid-generation is kept too — it is the only
   record of how far the model got
 
+Once the model starts assembling a **tool call**, the live view switches to
+the body that call is writing — decoded straight out of the half-finished
+arguments — and the finished body is written to the log as a syntax-
+highlighted block. That is what makes the approval question that follows
+answerable without putting the file inside the dialog (see
+[Approval modes](#approval-modes)).
+
 Headless mode is unchanged: it prints the final answer once, so piping the
-output stays scriptable.
+output stays scriptable. [Plain mode](#plain-mode) streams the same
+interaction as text.
 
 Streaming is a view onto generation, not a change to the loop. The agent
 still decides on a whole turn: tool calls are reassembled from their
@@ -330,6 +363,53 @@ Notes:
 - Token counts for a streamed round come from `stream_options:
   {"include_usage": true}`; a server that doesn't send that final usage chunk
   logs `usage: null` while everything else keeps working.
+
+&nbsp;
+
+## Plain mode
+
+`--mode plain` runs a request the way headless mode does, but prints the whole
+interaction instead of only the answer: the model's text as it is generated,
+every tool call with the body it carries, every result, and every corrective
+notice sent back to the model.
+
+```bash
+uv run harness-lab --mode plain "add a docstring to calc.py"
+```
+
+```text
+harness-lab · plain mode
+model Qwen3.5-4B-Q4_K_M.gguf · endpoint 127.0.0.1:8080 · workspace /tmp/demo · approval ask
+
+you> Create greet.py with a function greet(name) returning a greeting string.
+
+  ⋯ write_file
+def greet(name):
+    """Return a greeting string for the given name."""
+    return f"Hello, {name}!"
+
+  → write_file path=greet.py
+approve write_file path=greet.py · content: 3 lines, 101 B? [y/N] y
+  ← write_file
+wrote greet.py (3 lines, 101 chars)
+syntax OK
+
+model> Done. Created `greet.py` with a `greet(name)` function.
+```
+
+- Given a prompt (or piped stdin) it runs once and exits, like headless mode.
+  Started on a terminal with no prompt, it drops into a bare read-ask loop
+  that takes the same [slash commands](#interactive-commands) as the TUI.
+- Output is text, not a UI: it is colored on a terminal and plain when
+  redirected, so `--mode plain … > run.txt` gives a transcript that can be
+  diffed against another run — the same knob-changing workflow as the JSONL
+  logs, without a viewer.
+- Nothing is deliberately hidden and nothing is clipped, which makes it the
+  mode to reach for when a small model is doing something inexplicable and the
+  TUI's panels are in the way.
+
+`--mode plain` is never chosen by `auto`: its extra output would surprise
+anything piping the answer somewhere, so it is always an explicit request.
 
 &nbsp;
 
@@ -464,7 +544,8 @@ output quality, here's where each piece lives:
   `--temperature`, `--top-p`
 - **Transport** — `--stream` / `--no-stream`; changes when output is visible,
   and is worth flipping when a backend's streamed tool calls look suspect
-- **Friction on risky actions** — `--approval`
+- **Friction on risky actions** — `--approval`; `--mode plain` makes a whole
+  run readable as text when the question is why a change was approved
 
 Since every run is fully logged, a natural workflow is: change one of the
 above, rerun the same prompt against the same workspace, and diff the two

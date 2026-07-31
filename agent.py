@@ -505,21 +505,26 @@ class MiniAgent:
             # The UI callback must never break the agent loop.
             self.logger.log("event_callback_error", event_type=event_type)
 
-    def _delta_emitter(
+    def _stream_sinks(
         self: Self, on_event: Callable[..., None] | None
-    ) -> Callable[[str], None] | None:
-        """Bridge streamed model text to the front-end as `assistant_delta`.
+    ) -> tuple[Callable | None, Callable | None]:
+        """Bridge streamed output to the front-end, as text and as tool calls.
 
-        Returns None when nobody is listening, so a headless or delegated run
-        doesn't pay for a callback per token.
+        Both are None when nobody is listening, so a headless or delegated run
+        doesn't pay for a callback per token. The tool sink carries the raw
+        arguments assembled so far -- a front-end that wants to show the file
+        being written decodes it with `tool_support.streaming_body`.
         """
         if on_event is None:
-            return None
+            return None, None
 
-        def emit(text: str) -> None:
+        def on_text(text: str) -> None:
             self._emit(on_event, "assistant_delta", text=text)
 
-        return emit
+        def on_tool(name: str, args_text: str) -> None:
+            self._emit(on_event, "tool_delta", name=name, args_text=args_text)
+
+        return on_text, on_tool
 
     def ask(
         self: Self,
@@ -557,11 +562,13 @@ class MiniAgent:
                 ),
                 memory_text=self.memory_text(),
             )
+            on_text, on_tool = self._stream_sinks(on_event)
             response = self.model_client.complete(
                 messages,
                 self.max_new_tokens,
                 tools=self.tools.schemas(),
-                on_delta=self._delta_emitter(on_event),
+                on_delta=on_text,
+                on_tool_delta=on_tool,
             )
             self.logger.log(
                 "model_output",

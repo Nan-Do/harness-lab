@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import threading
 from time import monotonic
 from typing import Any, Dict
 
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.syntax import Syntax
 from rich.text import Text
 
 from textual import on, work
@@ -19,6 +19,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Header, Input, RichLog, Static
 
 from agent import MiniAgent
+from tool_support import size_note, split_args, streaming_body
 from utils import HELP_DETAILS, WELCOME_ART
 
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -30,15 +31,31 @@ _STREAM_REFRESH = 0.05
 _STREAM_TAIL_LINES = 8
 
 
-def _format_args(args: Dict[str, Any]) -> str:
-    try:
-        return json.dumps(args, ensure_ascii=False, sort_keys=True)
-    except TypeError:
-        return str(args)
+def _body_syntax(key: str, body: str, path: str) -> Syntax:
+    """Highlight a tool-call body the way its destination would be read."""
+    if key == "command":
+        lexer = "bash"
+    elif path:
+        lexer = Syntax.guess_lexer(path, code=body)
+    else:
+        lexer = "text"
+    return Syntax(
+        body,
+        lexer,
+        theme="ansi_dark",
+        background_color="default",
+        word_wrap=True,
+    )
 
 
 class ApprovalScreen(ModalScreen[bool]):
-    """Blocking yes/no dialog used for the `ask` approval policy."""
+    """Blocking yes/no dialog used for the `ask` approval policy.
+
+    Asks about the call, never with it: the file a write is about to commit
+    has already scrolled past in the conversation, so the dialog names the
+    tool, its short arguments, and how big the body is -- the things the
+    decision actually turns on -- and stays readable at any payload size.
+    """
 
     BINDINGS = [
         Binding("y", "approve", "Approve"),
@@ -51,11 +68,17 @@ class ApprovalScreen(ModalScreen[bool]):
         self._args = args
 
     def compose(self) -> ComposeResult:
-        body = Text.assemble(
-            ("Approve risky tool\n\n", "bold"),
-            (f"{self._name}", "bold yellow"),
-            (f" {_format_args(self._args)}", "dim"),
-        )
+        inline, bodies = split_args(self._args)
+        body = Text("Approve risky tool\n\n", style="bold")
+        body.append(self._name, style="bold yellow")
+        for key, value in inline:
+            body.append(f"\n  {key}  ", style="dim")
+            body.append(value)
+        for key, payload in bodies:
+            body.append(f"\n  {key}  ", style="dim")
+            body.append(size_note(payload), style="italic")
+        if bodies:
+            body.append("\n\nThe full text is shown above.", style="dim")
         yield Static(body, id="approval-body")
         with Horizontal(id="approval-buttons"):
             yield Button("Approve (y)", variant="success", id="approve")
@@ -150,6 +173,8 @@ class MiniAgentApp(App):
         self._spinner_index = 0
         # Written from the agent worker thread, rendered from the UI thread.
         self._stream_text = ""
+        self._stream_call = ""
+        self._stream_args = ""
         self._stream_painted = 0.0
 
     def compose(self) -> ComposeResult:
@@ -220,13 +245,34 @@ class MiniAgentApp(App):
         self._logview.write(Panel(Markdown(text), title="agent", border_style="green"))
 
     def _write_tool_call(self, name: str, args: Dict[str, Any]) -> None:
-        self._logview.write(
-            Text.assemble(
-                ("  → ", "bold blue"),
-                (name, "bold"),
-                (f" {_format_args(args)}", "dim"),
+        """Announce the call on one line, then show any body it carries.
+
+        The body is what the user is about to approve, so it is rendered as
+        code where it can be read, instead of being packed into the call line
+        (or, worse, into the approval dialog).
+        """
+        inline, bodies = split_args(args)
+        line = Text.assemble(("  → ", "bold blue"), (name, "bold"))
+        for key, value in inline:
+            line.append(f" {key}=", style="dim")
+            line.append(value)
+        self._logview.write(line)
+
+        path = str(args.get("path") or "")
+        for key, body in bodies:
+            label = f"{name} · {path}" if path else name
+            if key != "content":
+                label += f" · {key}"
+            self._logview.write(
+                Panel(
+                    _body_syntax(key, body, path),
+                    title=label,
+                    subtitle=size_note(body),
+                    border_style="dim blue",
+                    title_align="left",
+                    subtitle_align="right",
+                )
             )
-        )
 
     def _write_tool_result(self, name: str, result: str) -> None:
         is_error = result.startswith("error:")
@@ -250,17 +296,34 @@ class MiniAgentApp(App):
         return self.query_one("#stream", Static)
 
     def _render_stream(self) -> None:
-        """Repaint the live view with the tail of the text so far."""
-        text = self._stream_text
-        if not text.strip():
+        """Repaint the live view with the tail of what is being written.
+
+        Once a tool call starts assembling, the call takes over the view: the
+        file a write is building is what matters at that point, and seeing it
+        arrive is what makes the approval question that follows answerable.
+        """
+        view = Text()
+        if self._stream_args:
+            key, body = streaming_body(self._stream_args)
+            header = self._stream_call or "tool call"
+            if body:
+                view.append(f"{header} · {key}\n", style="bold")
+                view.append("\n".join(body.splitlines()[-_STREAM_TAIL_LINES:]))
+            else:
+                view.append(f"{header}…", style="bold")
+        else:
+            view.append("\n".join(self._stream_text.splitlines()[-_STREAM_TAIL_LINES:]))
+
+        if not view.plain.strip():
             self._streamview.display = False
             return
-        tail = "\n".join(text.splitlines()[-_STREAM_TAIL_LINES:])
-        self._streamview.update(Text(tail))
+        self._streamview.update(view)
         self._streamview.display = True
 
     def _reset_stream(self) -> None:
         self._stream_text = ""
+        self._stream_call = ""
+        self._stream_args = ""
         self._streamview.update("")
         self._streamview.display = False
 
@@ -352,7 +415,11 @@ class MiniAgentApp(App):
     def _on_agent_event(self, event_type: str, **data: Any) -> None:
         """Called from the worker thread; marshal back onto the UI thread."""
         if event_type == "assistant_delta":
-            self._on_stream_delta(data.get("text", ""))
+            self._on_stream_delta(text=data.get("text", ""))
+        elif event_type == "tool_delta":
+            self._on_stream_delta(
+                call=data.get("name", ""), args=data.get("args_text", "")
+            )
         elif event_type == "thinking":
             self.call_from_thread(self._reset_stream)
         elif event_type == "tool_call":
@@ -381,15 +448,19 @@ class MiniAgentApp(App):
             self.call_from_thread(self._end_stream, False)
             self.call_from_thread(self._write_agent, data.get("text", ""))
 
-    def _on_stream_delta(self, text: str) -> None:
-        """Buffer streamed text on the worker thread, repainting on a tick.
+    def _on_stream_delta(self, text: str = "", call: str = "", args: str = "") -> None:
+        """Buffer streamed output on the worker thread, repainting on a tick.
 
-        Every repaint is a cross-thread hop, so tokens accumulate between
+        Every repaint is a cross-thread hop, so output accumulates between
         them; whatever the last hop missed is picked up when the turn ends.
+        Tool arguments arrive already accumulated, so they replace rather than
+        extend, and decoding them is left to the (throttled) repaint.
         """
-        if not text:
-            return
-        self._stream_text += text
+        if text:
+            self._stream_text += text
+        if call or args:
+            self._stream_call = call or self._stream_call
+            self._stream_args = args
         elapsed = monotonic() - self._stream_painted
         if elapsed < _STREAM_REFRESH:
             return

@@ -375,6 +375,125 @@ def coerce_list_content(value: object) -> Tuple[object, str]:
     return value, ""
 
 
+# --- Call presentation -------------------------------------------------------
+# A front-end has to show what a tool is about to do without dumping the file
+# it is about to write into a one-line label or a modal dialog. The split is
+# always by size, never by argument name: whatever is short enough to read at a
+# glance stays on the call line, and a body goes to a block of its own that the
+# front-end renders (and streams) where there is room for it.
+
+
+# Arguments known to carry a body, most-recently-written first. Only used to
+# decide which one to follow while a call is still streaming; what counts as a
+# body is decided by size below.
+BODY_ARGS = ("content", "new_text", "old_text", "command", "task")
+
+# Longer than this, or spanning lines, and an argument is a body, not a label.
+INLINE_ARG_LIMIT = 120
+
+
+def size_note(text: str) -> str:
+    """Human-readable size of a body: what a reader needs to judge it."""
+    body = str(text)
+    lines = body.count("\n") + (1 if body and not body.endswith("\n") else 0)
+    size = len(body.encode("utf-8", "replace"))
+    unit = f"{size} B" if size < 1024 else f"{size / 1024:.1f} kB"
+    return f"{lines} line{'s' if lines != 1 else ''}, {unit}"
+
+
+def split_args(args: Dict) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+    """Split arguments into (inline labels, bodies worth their own block)."""
+    inline: List[Tuple[str, str]] = []
+    bodies: List[Tuple[str, str]] = []
+    for key, value in (args or {}).items():
+        text = value if isinstance(value, str) else json.dumps(value, default=str)
+        if isinstance(value, str) and ("\n" in value or len(value) > INLINE_ARG_LIMIT):
+            bodies.append((key, value))
+        else:
+            inline.append((key, text))
+    return inline, bodies
+
+
+def describe_call(name: str, args: Dict) -> str:
+    """One line naming the call and its arguments, with bodies as sizes only.
+
+    This is the text an approval prompt asks about: enough to decide on, and
+    never the payload itself -- that is shown in the conversation, where it can
+    be read as code instead of as a quoted JSON blob.
+    """
+    inline, bodies = split_args(args)
+    parts = [f"{key}={value}" for key, value in inline]
+    parts += [f"{key}: {size_note(body)}" for key, body in bodies]
+    if not parts:
+        return name
+    return f"{name} " + " · ".join(parts)
+
+
+def _decode_partial(body: str) -> str:
+    """Decode a JSON string body that may be cut off mid-value or mid-escape."""
+    escapes = {
+        '"': '"',
+        "\\": "\\",
+        "/": "/",
+        "b": "\b",
+        "f": "\f",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+    }
+    out: List[str] = []
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char == '"':
+            break
+        if char != "\\":
+            out.append(char)
+            index += 1
+            continue
+        if index + 1 >= len(body):
+            break  # escape cut off by the chunk boundary; it arrives next time
+        marker = body[index + 1]
+        if marker in escapes:
+            out.append(escapes[marker])
+            index += 2
+        elif marker == "u":
+            if index + 6 > len(body):
+                break
+            try:
+                out.append(chr(int(body[index + 2 : index + 6], 16)))
+            except ValueError:
+                break
+            index += 6
+        else:
+            break
+    return "".join(out)
+
+
+def streaming_body(raw_args: str) -> Tuple[str, str]:
+    """(argument name, text so far) of the body a streamed call is writing.
+
+    The arguments arrive as JSON assembled a few characters at a time, so it is
+    never parseable until the call is complete -- but the file being written is
+    exactly what someone about to approve the write wants to watch. This reads
+    the value being filled in right now straight out of the half-finished blob,
+    and returns ("", "") until one starts.
+    """
+    raw = str(raw_args)
+    found = [(raw.rfind(f'"{key}"'), key) for key in BODY_ARGS]
+    at, key = max(found)
+    if at < 0:
+        return "", ""
+    rest = raw[at + len(key) + 2 :]
+    colon = rest.find(":")
+    if colon < 0:
+        return "", ""
+    rest = rest[colon + 1 :].lstrip()
+    if not rest.startswith('"'):
+        return "", ""
+    return key, _decode_partial(rest[1:])
+
+
 # --- Output shaping ----------------------------------------------------------
 
 

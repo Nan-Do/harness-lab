@@ -119,6 +119,30 @@ def test_streamed_tool_call_fragments_are_joined():
     assert response.truncated is False
 
 
+def test_tool_call_fragments_are_reported_as_they_assemble():
+    """A front-end needs the call while it is being written, not after."""
+    model = client()
+    seen: List[tuple] = []
+    feed(
+        model,
+        [
+            chunk(tool_calls=[call_fragment(call_id="call_1", name="write_file")]),
+            chunk(tool_calls=[call_fragment(arguments='{"path": "main.py", ')]),
+            chunk(tool_calls=[call_fragment(arguments='"content": "x"}')]),
+            chunk(finish_reason="tool_calls"),
+        ],
+    )
+
+    model.complete([], 128, tools=[], on_tool_delta=lambda *args: seen.append(args))
+
+    assert [name for name, _ in seen] == ["write_file"] * 3
+    assert [args for _, args in seen] == [
+        "",
+        '{"path": "main.py", ',
+        '{"path": "main.py", "content": "x"}',
+    ]
+
+
 def test_usage_only_final_chunk_is_not_mistaken_for_content():
     model = client()
     tail = SimpleNamespace(choices=[], usage=usage(42))

@@ -6,6 +6,7 @@ from pathlib import Path
 from agent import MiniAgent
 from agent_logging import AgentLogger
 from model_clients import LlamaCppModelClient
+from plain import run_plain
 from session import SessionStore
 from tui import run_tui
 from utils import DEFAULT_MAX_NOISY_OUTPUT, TOOL_PROFILES
@@ -70,11 +71,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("prompt", nargs="*", help="Optional one-shot prompt.")
     parser.add_argument(
         "--mode",
-        choices=("auto", "tui", "headless"),
+        choices=("auto", "tui", "headless", "plain"),
         default="auto",
         help=(
             "Interface mode. 'tui' launches the interactive Textual UI, "
             "'headless' runs a single request and prints the answer, "
+            "'plain' prints the whole interaction (streamed model text, tool "
+            "calls, bodies, results) as plain text, "
             "'auto' picks headless when a prompt/piped input is present and the "
             "TUI otherwise."
         ),
@@ -180,7 +183,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def resolve_mode(mode: str, prompt: str) -> str:
-    """Decide between the headless and TUI front-ends."""
+    """Decide between the headless and TUI front-ends.
+
+    Only `auto` is inferred; `plain` is always an explicit choice, since its
+    extra output would surprise anything piping the answer somewhere.
+    """
     if mode != "auto":
         return mode
     # A prompt argument or piped stdin means a non-interactive, scriptable run.
@@ -222,6 +229,9 @@ def main() -> int:
 
     if mode == "headless":
         return run_headless(agent, prompt)
+
+    if mode == "plain":
+        return run_plain(agent, prompt, endpoint)
 
     return run_tui(
         agent,

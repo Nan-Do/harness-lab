@@ -1,4 +1,3 @@
-import json
 import shutil
 import subprocess
 import sys
@@ -26,6 +25,7 @@ from tool_support import (
     apply_arg_aliases,
     clip,
     coerce_list_content,
+    describe_call,
     find_fuzzy_match,
     match_lines,
     nearest_block,
@@ -1493,10 +1493,11 @@ class ToolRegistry:
             return False
         if self.approval_fn is not None:
             return bool(self.approval_fn(name, args))
+        # The question names the call and sizes its payload; the payload itself
+        # has already gone past in the conversation, where it reads as code
+        # rather than as JSON wedged into a prompt line.
         try:
-            answer = input(
-                f"approve {name} {json.dumps(args, ensure_ascii=True)}? [y/N] "
-            )
+            answer = input(f"approve {describe_call(name, args)}? [y/N] ")
         except EOFError:
             return False
         return answer.strip().lower() in {"y", "yes"}

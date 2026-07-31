@@ -131,15 +131,19 @@ class LlamaCppModelClient:
         tools,
         max_new_tokens,
         on_delta: Callable[[str], None] | None,
+        on_tool_delta: Callable[[str, str], None] | None = None,
     ) -> Turn:
-        """Consume the SSE stream, handing text to `on_delta` as it lands.
+        """Consume the SSE stream, handing output to the callbacks as it lands.
 
         Text arrives token by token and tool calls arrive as fragments keyed by
         `index` -- name first, then the arguments JSON a few characters at a
-        time -- so both are reassembled here. The turn is only complete once
-        the stream is exhausted, which is why the caller still sees a whole
-        `Turn`: streaming changes when the user sees the text, not what the
-        agent loop gets to decide on.
+        time -- so both are reassembled here. `on_tool_delta` gets the call's
+        name and the arguments assembled so far, which is how a front-end can
+        show the file a write is building before it asks to approve it.
+
+        The turn is only complete once the stream is exhausted, which is why
+        the caller still sees a whole `Turn`: streaming changes when the user
+        sees the output, not what the agent loop gets to decide on.
         """
         turn = Turn()
         slots: dict[int, RawToolCall] = {}
@@ -173,6 +177,8 @@ class LlamaCppModelClient:
                         slot.name += call.function.name
                     if call.function.arguments:
                         slot.arguments += call.function.arguments
+                    if on_tool_delta is not None:
+                        on_tool_delta(slot.name, slot.arguments)
         except OpenAIError as exc:
             raise RuntimeError(
                 f"LlamaCpp chat completion stream failed: {exc}"
@@ -226,12 +232,14 @@ class LlamaCppModelClient:
         max_new_tokens: int,
         tools: list[dict] | None = None,
         on_delta: Callable[[str], None] | None = None,
+        on_tool_delta: Callable[[str, str], None] | None = None,
     ) -> ModelResponse:
         """Run one model turn, continuing it if it stops at the token limit.
 
         With streaming on, `on_delta` is called with each piece of text as the
-        server produces it; it is only a view onto the answer being written,
-        so the return value is the same either way.
+        server produces it and `on_tool_delta` with each tool call as it is
+        assembled; both are views onto output being written, so the return
+        value is the same either way.
         """
         self.logger.log(
             "llm_request",
@@ -255,7 +263,7 @@ class LlamaCppModelClient:
         while has_more_data:
             if self.stream:
                 turn = self.__complete_streamed(
-                    messages, tools, max_new_tokens, on_delta
+                    messages, tools, max_new_tokens, on_delta, on_tool_delta
                 )
             else:
                 turn = self.__complete_whole(messages, tools, max_new_tokens)
