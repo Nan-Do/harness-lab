@@ -175,6 +175,20 @@ class MiniAgent:
         return "delegate_result:\n" + child.ask(task)
 
     def build_prefix(self: Self) -> str:
+        planning = ""
+        if self.add_planning:
+            planning = "\n".join(
+                [
+                    "Planning:",
+                    "- Break down the problem into logical requirements.",
+                    "- Outline the core algorithm, data structures, and edge cases to consider.",
+                    "- List the sequential steps you will take to implement the solution.",
+                    "Solution:",
+                    "- Implement the complete, clean code based on your plan.",
+                    "- Include any necessary execution details or usage examples.",
+                ]
+            )
+
         rules = "\n".join(
             [
                 "- Use the provided tools instead of guessing about the workspace.",
@@ -194,23 +208,11 @@ class MiniAgent:
                 "- Required tool arguments must not be empty.",
             ]
         )
-        if self.add_planning:
-            rules += "\n".join(
-                [
-                    "",
-                    "Planning:",
-                    "- Break down the problem into logical requirements.",
-                    "- Outline the core algorithm, data structures, and edge cases to consider.",
-                    "- List the sequential steps you will take to implement the solution.",
-                    "Solution:",
-                    "- Implement the complete, clean code based on your plan.",
-                    "- Include any necessary execution details or usage examples.",
-                ]
-            )
 
         return "\n\n".join(
             [
                 "You are Harness Lab, a small local coding agent running through llama-server.",
+                planning,
                 "Rules:\n" + rules,
                 self.workspace.text(),
             ]
