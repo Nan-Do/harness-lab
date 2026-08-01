@@ -12,8 +12,14 @@ Usage:
     logviz.py --stats                  # per-session summary table instead of the stream
     logviz.py --compact                # one line per event
     logviz.py --full                   # do not truncate long fields
+    logviz.py --max-lines 20           # lines shown per text block (0 = unlimited)
     logviz.py -f                       # follow (tail -f) new lines as they are appended
     logviz.py --raw                    # dump raw indented JSON instead of narrative
+
+Events carrying a chat transcript (llm_request, llm_continuation) or tool
+arguments are rendered as a readable conversation rather than as JSON: message
+bodies are printed as text, and tool call arguments -- which travel as a JSON
+string nested inside the JSON record -- are decoded first.
 """
 
 import argparse
@@ -45,11 +51,26 @@ class C:
 
 _NO_COLOR = False
 
+# Max lines shown per text block (message body, file content, traceback...)
+# before the rest is elided. 0 means unlimited; --full ignores it entirely.
+_MAX_LINES = 6
+
+# --compact promises one line per event, so the block layouts below collapse.
+_COMPACT = False
+
 
 def col(text, *codes):
     if _NO_COLOR or not codes:
         return text
     return "".join(codes) + text + C.RESET
+
+
+_ANSI = re.compile(r"\033\[[0-9;]*m")
+
+
+def plain_len(text):
+    """Visible length of a string that may already carry color codes."""
+    return len(_ANSI.sub("", str(text)))
 
 
 # --------------------------------------------------------------------------
@@ -66,14 +87,33 @@ EVENT_STYLE = {
     "prompt_built": ("PROMPT", (C.GRAY,)),
     "llm_request": ("LLM ->", (C.GRAY,)),
     "llm_response": ("LLM <-", (C.YELLOW,)),
+    "llm_continuation": ("LLM ...", (C.YELLOW,)),
     "model_output": ("OUTPUT", (C.GRAY,)),
     "tool_call": ("TOOL", (C.BLUE, C.BOLD)),
     "tool_result": ("RESULT", (C.BLUE,)),
+    "tool_outcome": ("OUTCOME", (C.GRAY,)),
     "tool_approval": ("APPROVAL", (C.MAGENTA,)),
     "tool_error": ("TOOL ERR", (C.RED, C.BOLD)),
+    "tool_unknown": ("NO TOOL", (C.RED,)),
+    "tool_blocked": ("BLOCKED", (C.YELLOW,)),
+    "tool_name_recovered": ("RENAMED", (C.GRAY,)),
+    "tool_args_normalized": ("ARGS FIX", (C.GRAY,)),
     "malformed_tool_call": ("MALFORMED", (C.RED,)),
+    "context_budget": ("BUDGET", (C.GRAY,)),
+    "history_window": ("EVICTED", (C.YELLOW,)),
+    "repl_command": ("COMMAND", (C.CYAN,)),
+    "repl_error": ("REPL ERR", (C.RED,)),
     "retry": ("RETRY", (C.YELLOW,)),
+    "reset": ("RESET", (C.MAGENTA,)),
     "final": ("FINAL", (C.GREEN, C.BOLD)),
+}
+
+# chat roles, as they appear inside the `messages` payloads
+ROLE_STYLE = {
+    "system": (C.MAGENTA,),
+    "user": (C.CYAN,),
+    "assistant": (C.YELLOW,),
+    "tool": (C.BLUE,),
 }
 
 # events that are internal bookkeeping / duplicate what llm_response,
@@ -122,16 +162,223 @@ def fmt_json_compact(obj, width, full=False):
     return truncate(one_line(s), width, full)
 
 
-def indent_block(text, prefix="      "):
-    return "\n".join(prefix + line for line in str(text).split("\n"))
-
-
 def short_session(session):
     if not session:
         return "-"
     # sessions look like 20260724-233204-c8f95e ; the trailing hex is the
     # useful discriminator when several sessions are interleaved.
     return session.split("-")[-1] if "-" in session else session
+
+
+# --------------------------------------------------------------------------
+# pretty-printing of payloads (messages, tool arguments, long text)
+# --------------------------------------------------------------------------
+
+
+def decode_json_string(value):
+    """Return the object encoded in a JSON *string*, else None.
+
+    Tool call arguments cross the wire as a JSON string nested inside the JSON
+    record, so without this step they render as one escaped blob.
+    """
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    if len(stripped) < 2 or stripped[0] not in "{[" or stripped[-1] not in "}]":
+        return None
+    try:
+        obj = json.loads(stripped)
+    except (TypeError, ValueError):
+        return None
+    return obj if isinstance(obj, (dict, list)) else None
+
+
+def text_lines(text, w, full, gutter="", codes=()):
+    """Lay text out as display lines, clipping each line and the line count."""
+    if _COMPACT:
+        return [col(truncate(one_line(text), w, full), *codes)]
+    lines = str(text).split("\n")
+    if len(lines) > 1 and not lines[-1].strip():
+        # a trailing newline is the norm for file bodies; don't spend a line on it
+        lines.pop()
+    dropped = 0
+    if not full and _MAX_LINES > 0 and len(lines) > _MAX_LINES:
+        dropped = len(lines) - _MAX_LINES
+        lines = lines[:_MAX_LINES]
+    out = [gutter + col(truncate(line, w, full), *codes) for line in lines]
+    if dropped:
+        out.append(gutter + col(f"... [+{dropped} more lines]", C.GRAY))
+    return out
+
+
+def labeled_text(label, text, w, full, gutter="  | ", codes=()):
+    """A label above its indented body -- folded onto one line when compact."""
+    if _COMPACT:
+        return [f"{label} {col(truncate(one_line(text), w, full), *codes)}"]
+    return [label] + text_lines(text, w, full, gutter=gutter, codes=codes)
+
+
+def fmt_json_block(obj, w, full, gutter=""):
+    """Indented multi-line JSON, for values with no better textual form."""
+    try:
+        pretty = json.dumps(obj, indent=2, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        pretty = str(obj)
+    return text_lines(pretty, w, full, gutter=gutter)
+
+
+def is_block_value(value, w):
+    """True when a value wants its own lines instead of sitting on the header."""
+    if _COMPACT:
+        return False
+    if isinstance(value, str):
+        return "\n" in value or (w > 0 and len(value) > w // 2)
+    return isinstance(value, (dict, list)) and bool(value)
+
+
+def fmt_scalar(value, w, full):
+    try:
+        return truncate(json.dumps(value, ensure_ascii=False, default=str), w, full)
+    except (TypeError, ValueError):
+        return truncate(str(value), w, full)
+
+
+def fmt_args_inline(args, w, full):
+    """`key=value, ...` on one line, or None when the values need their own."""
+    if args is None:
+        return ""
+    if not isinstance(args, dict):
+        return fmt_json_compact(args, w, full)
+    if not args:
+        return ""
+    parts = []
+    for key, value in args.items():
+        if is_block_value(value, w):
+            return None
+        # colors are dropped in compact mode: the line is truncated afterwards
+        # and a cut through an escape sequence would bleed into the terminal
+        label = key if _COMPACT else col(key, C.GRAY)
+        parts.append(f"{label}={fmt_scalar(value, w, full)}")
+    line = ", ".join(parts)
+    if _COMPACT:
+        return truncate(one_line(line), w, full)
+    if not full and w > 0 and plain_len(line) > w:
+        return None
+    return line
+
+
+def fmt_args_block(args, w, full, indent=""):
+    """One key per line; text and nested structures get an indented body."""
+    if not isinstance(args, dict):
+        return fmt_json_block(args, w, full, gutter=indent)
+    lines = []
+    for key, value in args.items():
+        decoded = decode_json_string(value)
+        if decoded is not None:
+            value = decoded
+        label = f"{indent}{col(key, C.GRAY)}:"
+        if isinstance(value, str) and is_block_value(value, w):
+            lines.append(label)
+            lines.extend(text_lines(value, w, full, gutter=indent + "  | "))
+        elif isinstance(value, (dict, list)) and value:
+            lines.append(label)
+            lines.extend(fmt_json_block(value, w, full, gutter=indent + "  | "))
+        else:
+            lines.append(f"{label} {fmt_scalar(value, w, full)}")
+    return lines
+
+
+def fmt_call(name, args, w, full, indent="", label="", suffix=""):
+    """`name(args)` on one line when it fits, else a header plus an arg block."""
+    head = f"{indent}{label}{col(str(name), C.BOLD)}"
+    tail = f"  {col(suffix, C.GRAY)}" if suffix else ""
+    inline = fmt_args_inline(args, w, full)
+    if inline is not None:
+        return [f"{head}({inline}){tail}"]
+    # Indentation delimits the arguments here, so parentheses would only add
+    # a stray line above and below the block.
+    return [head + tail] + fmt_args_block(args, w, full, indent + "    ")
+
+
+def fmt_tool_call_message(call, w, full, indent=""):
+    """One entry of a chat message's `tool_calls` array."""
+    function = call.get("function") if isinstance(call, dict) else None
+    function = function if isinstance(function, dict) else {}
+    name = function.get("name") or call.get("name") or "?"
+    call_id = call.get("id") or ""
+    suffix = f"id={call_id}" if call_id else ""
+    label = col("-> ", C.BLUE)
+
+    raw = function.get("arguments", call.get("args"))
+    args = raw if isinstance(raw, dict) else decode_json_string(raw)
+    if args is None and raw not in (None, ""):
+        # Unparseable arguments are exactly what a truncated call looks like,
+        # so show the raw text instead of hiding the call.
+        body = col(truncate(one_line(raw), w, full), C.RED)
+        return [f"{indent}{label}{col(str(name), C.BOLD)}({body})"]
+    return fmt_call(name, args or {}, w, full, indent=indent, label=label, suffix=suffix)
+
+
+def fmt_message(index, message, w, full, indent=""):
+    """Render one chat message: a header line plus its body and tool calls."""
+    if not isinstance(message, dict):
+        return [indent + truncate(one_line(message), w, full)]
+
+    role = str(message.get("role") or "?")
+    meta = []
+    if message.get("name"):
+        meta.append(f"name={message['name']}")
+    if message.get("tool_call_id"):
+        meta.append(f"id={message['tool_call_id']}")
+    content = message.get("content")
+    if isinstance(content, str) and content:
+        meta.append(f"{len(content)} chars")
+
+    header = f"{indent}{col(f'[{index}]', C.GRAY)} {col(role, *ROLE_STYLE.get(role, (C.GRAY,)))}"
+    if meta:
+        header += "  " + col(", ".join(meta), C.GRAY)
+    lines = [header]
+
+    body = indent + "    "
+    if isinstance(content, str) and content.strip():
+        lines.extend(text_lines(content, w, full, gutter=body + "| "))
+    elif content:
+        lines.extend(fmt_json_block(content, w, full, gutter=body + "| "))
+
+    for call in message.get("tool_calls") or []:
+        lines.extend(fmt_tool_call_message(call, w, full, indent=body))
+    return lines
+
+
+def messages_digest(messages):
+    """`8 messages (system=1 user=3 assistant=2 tool=2, 4,210 chars)`."""
+    counts = {}
+    chars = 0
+    for message in messages:
+        role = str(message.get("role") or "?") if isinstance(message, dict) else "?"
+        counts[role] = counts.get(role, 0) + 1
+        if isinstance(message, dict):
+            content = message.get("content")
+            chars += len(content) if isinstance(content, str) else 0
+    roles = " ".join(f"{role}={n}" for role, n in counts.items())
+    return f"{len(messages)} messages ({roles}, {chars:,} chars)"
+
+
+def fmt_messages(messages, w, full, indent=""):
+    """A chat transcript as a conversation.
+
+    Only the digest is shown by default -- every request re-sends the whole
+    history, so the transcript is worth screen space only when asked for with
+    --full.
+    """
+    if not messages:
+        return []
+    lines = [indent + col(messages_digest(messages), C.GRAY)]
+    if not full:
+        return lines
+    for index, message in enumerate(messages, 1):
+        lines.extend(fmt_message(index, message, w, full, indent))
+    return lines
 
 
 # --------------------------------------------------------------------------
@@ -149,12 +396,12 @@ def render_session_start(d, w, full):
 
 
 def render_repl_input(d, w, full):
-    return f"mode={d.get('mode')}", [f'"{truncate(d.get("text"), w, full)}"']
+    return f"mode={d.get('mode')}", text_lines(d.get("text"), w, full, gutter="> ")
 
 
 def render_request_start(d, w, full):
     hdr = f"max_steps={d.get('max_steps')} max_new_tokens={d.get('max_new_tokens')}"
-    return hdr, [f'"{truncate(d.get("user_message"), w, full)}"']
+    return hdr, text_lines(d.get("user_message"), w, full, gutter="> ")
 
 
 def render_memory_update(d, w, full):
@@ -165,16 +412,26 @@ def render_memory_update(d, w, full):
     hdr = f"reason={d.get('reason')} files={len(files)} notes={len(notes)}"
     lines = []
     if full:
-        lines.append(fmt_json_compact(mem, w, full=True))
+        if task:
+            lines.append(f"{col('task:', C.GRAY)} {task}")
+        if files:
+            lines.append(f"{col('files:', C.GRAY)} " + ", ".join(str(f) for f in files))
+        lines.extend(f"{col('note:', C.GRAY)} {note}" for note in notes)
     elif notes:
         lines.append(f"latest note: {truncate(notes[-1], w, full)}")
     return hdr, lines
 
 
 def render_history_append(d, w, full):
-    hdr = f"role={d.get('role')} name={d.get('name')} idx={d.get('index')}"
+    # tool entries carry name/args, message entries carry role
+    who = d.get("role") or d.get("name") or d.get("entry")
+    hdr = f"entry={d.get('entry')} {who} idx={d.get('index')}"
+    lines = []
+    if d.get("args") is not None:
+        lines.extend(fmt_call(d.get("name"), d.get("args"), w, full))
     content = d.get("content")
-    lines = [truncate(one_line(content), w, full)] if content else []
+    if content:
+        lines.extend(text_lines(content, w, full))
     return hdr, lines
 
 
@@ -184,16 +441,23 @@ def render_prompt_built(d, w, full):
         f"messages={d.get('message_count')} roles={','.join(d.get('roles') or [])} "
         f"chars={d.get('chars')}"
     )
-    return hdr, []
+    memory = d.get("memory_text")
+    lines = text_lines(memory, w, full) if full and memory else []
+    return hdr, lines
 
 
 def render_llm_request(d, w, full):
-    hdr = f"model={d.get('model')} backend={d.get('backend')} tools={len(d.get('tools') or [])}"
-    lines = []
-    if full:
-        for m in d.get("messages") or []:
-            lines.append(f"[{m.get('role')}] {fmt_json_compact(m, w, full=True)}")
-    return hdr, lines
+    hdr = (
+        f"model={d.get('model')} backend={d.get('backend')} "
+        f"stream={d.get('stream')} max_tokens={d.get('max_tokens')} "
+        f"tools={len(d.get('tools') or [])}"
+    )
+    return hdr, fmt_messages(d.get("messages") or [], w, full)
+
+
+def render_llm_continuation(d, w, full):
+    hdr = f"round={d.get('round')} {d.get('reason')}"
+    return hdr, fmt_messages(d.get("messages") or [], w, full)
 
 
 def _fmt_usage(usage):
@@ -213,17 +477,22 @@ def render_llm_response(d, w, full):
     hdr = f"round={d.get('round')} finish={d.get('finish_reason')} {_fmt_usage(d.get('usage'))}"
     lines = []
     for tc in d.get("tool_calls") or []:
-        lines.append(
-            col("call: ", C.BLUE)
-            + f"{tc.get('name')}({fmt_json_compact(tc.get('args'), w, full)})"
+        lines.extend(
+            fmt_call(tc.get("name"), tc.get("args"), w, full, label=col("call: ", C.BLUE))
         )
     for mc in d.get("malformed_tool_calls") or []:
         lines.append(
             col("malformed: ", C.RED)
             + f"{mc.get('name')}: {truncate(mc.get('error'), w, full)}"
         )
+        if mc.get("raw_args"):
+            lines.extend(
+                text_lines(mc["raw_args"], w, full, gutter="  | ", codes=(C.RED,))
+            )
     if d.get("content"):
-        lines.append(col("says: ", C.YELLOW) + truncate(d.get("content"), w, full))
+        lines.extend(
+            labeled_text(col("says:", C.YELLOW), d["content"], w, full, gutter="  ")
+        )
     return hdr, lines
 
 
@@ -233,24 +502,26 @@ def render_model_output(d, w, full):
     calls = d.get("tool_calls") or []
     if calls:
         lines.append("tool_calls: " + ", ".join(calls))
+    for mc in d.get("malformed_tool_calls") or []:
+        lines.append(
+            col("malformed: ", C.RED)
+            + f"{mc.get('name')}: {truncate(mc.get('error'), w, full)}"
+        )
     if d.get("content"):
-        lines.append(truncate(d.get("content"), w, full))
+        lines.extend(text_lines(d.get("content"), w, full))
     return hdr, lines
 
 
 def render_tool_call(d, w, full):
     hdr = f"step={d.get('step')}"
-    return hdr, [f"{d.get('name')}({fmt_json_compact(d.get('args'), w, full)})"]
+    return hdr, fmt_call(d.get("name"), d.get("args"), w, full)
 
 
 def render_tool_result(d, w, full):
     hdr = f"step={d.get('step')} name={d.get('name')}"
     result = d.get("result")
     is_error = isinstance(result, str) and result.startswith("error:")
-    line = truncate(result, w, full)
-    if is_error:
-        line = col(line, C.RED)
-    return hdr, [line]
+    return hdr, text_lines(result, w, full, codes=(C.RED,) if is_error else ())
 
 
 def render_tool_approval(d, w, full):
@@ -258,33 +529,35 @@ def render_tool_approval(d, w, full):
     granted_s = col("granted", C.GREEN) if granted else col("DENIED", C.RED, C.BOLD)
     risky_s = col("risky", C.RED, C.BOLD) if d.get("risky") else "safe"
     hdr = f"{granted_s} policy={d.get('policy')} {risky_s} read_only={d.get('read_only')}"
-    return hdr, [f"{d.get('name')}({fmt_json_compact(d.get('args'), w, full)})"]
+    return hdr, fmt_call(d.get("name"), d.get("args"), w, full)
 
 
 def render_tool_error(d, w, full):
     hdr = f"{d.get('name')}: {d.get('error_type')}"
-    lines = [truncate(d.get("error"), w, full)]
+    lines = text_lines(d.get("error"), w, full, codes=(C.RED,))
+    if d.get("args") is not None:
+        lines.extend(fmt_call(d.get("name"), d.get("args"), w, full))
     if full and d.get("traceback"):
-        lines.append(indent_block(d.get("traceback")))
+        lines.extend(text_lines(d.get("traceback"), w, full, gutter="  ", codes=(C.GRAY,)))
     return hdr, lines
 
 
 def render_malformed_tool_call(d, w, full):
     hdr = f"attempt={d.get('attempt')} name={d.get('name')}"
-    lines = [truncate(d.get("error"), w, full)]
-    if full:
-        lines.append("raw_args: " + truncate(d.get("raw_args"), w, full))
+    lines = text_lines(d.get("error"), w, full, codes=(C.RED,))
+    if d.get("raw_args"):
+        lines.extend(labeled_text(col("raw_args:", C.GRAY), d["raw_args"], w, full))
     return hdr, lines
 
 
 def render_retry(d, w, full):
     hdr = f"attempt={d.get('attempt')}"
-    return hdr, [truncate(d.get("notice"), w, full)]
+    return hdr, text_lines(d.get("notice"), w, full)
 
 
 def render_final(d, w, full):
     hdr = f"reason={d.get('reason')} attempts={d.get('attempts')} tool_steps={d.get('tool_steps')}"
-    return hdr, [truncate(d.get("final"), w, full)]
+    return hdr, text_lines(d.get("final"), w, full)
 
 
 RENDERERS = {
@@ -296,6 +569,7 @@ RENDERERS = {
     "prompt_built": render_prompt_built,
     "llm_request": render_llm_request,
     "llm_response": render_llm_response,
+    "llm_continuation": render_llm_continuation,
     "model_output": render_model_output,
     "tool_call": render_tool_call,
     "tool_result": render_tool_result,
@@ -307,10 +581,35 @@ RENDERERS = {
 }
 
 
+SKIP_FIELDS = {"event", "ts", "session", "depth", "_source", "_rsession"}
+
+
 def render_generic(d, w, full):
-    skip = {"event", "ts", "session", "depth", "_source", "_rsession"}
-    parts = [f"{k}={fmt_json_compact(v, w, full)}" for k, v in d.items() if k not in skip]
-    return " ".join(parts), []
+    """Fallback for events with no dedicated renderer.
+
+    Scalars go on the header; a chat transcript, a nested structure or any
+    multi-line text gets its own indented block rather than being flattened
+    into escaped JSON.
+    """
+    parts = []
+    lines = []
+    for key, value in d.items():
+        if key in SKIP_FIELDS:
+            continue
+        if key == "messages" and isinstance(value, list):
+            lines.extend(fmt_messages(value, w, full))
+        elif key == "args" and isinstance(value, dict):
+            lines.extend(fmt_call(d.get("name", "args"), value, w, full))
+        elif is_block_value(value, w):
+            label = col(key + ":", C.GRAY)
+            if isinstance(value, str):
+                lines.extend(labeled_text(label, value, w, full))
+            else:
+                lines.append(label)
+                lines.extend(fmt_json_block(value, w, full, gutter="  | "))
+        else:
+            parts.append(f"{key}={fmt_scalar(value, w, full)}")
+    return " ".join(parts), lines
 
 
 # --------------------------------------------------------------------------
@@ -337,12 +636,12 @@ def render_event(d, width, full, compact, source=None):
     first = f"{indent}{prefix}  {hdr}".rstrip()
 
     if compact:
-        extra = " | " + " ; ".join(one_line(l) for l in lines) if lines else ""
+        extra = " | " + " ; ".join(one_line(line) for line in lines) if lines else ""
         return first + extra
 
     out = [first]
-    for l in lines:
-        for sub in str(l).split("\n"):
+    for line in lines:
+        for sub in str(line).split("\n"):
             out.append(f"{indent}              {sub}")
     return "\n".join(out)
 
@@ -583,8 +882,19 @@ def build_parser():
         "prompt_built, llm_request, model_output)",
     )
     p.add_argument("-c", "--compact", action="store_true", help="one line per event")
-    p.add_argument("--full", action="store_true", help="do not truncate long fields")
+    p.add_argument(
+        "--full",
+        action="store_true",
+        help="do not truncate long fields; print chat transcripts in full",
+    )
     p.add_argument("-w", "--width", type=int, default=180, help="truncation width (default 180)")
+    p.add_argument(
+        "--max-lines",
+        type=int,
+        default=_MAX_LINES,
+        metavar="N",
+        help=f"lines shown per text block, 0 for unlimited (default {_MAX_LINES})",
+    )
     p.add_argument("--stats", action="store_true", help="print per-session summary and exit")
     p.add_argument("--raw", action="store_true", help="dump raw indented JSON, no narrative")
     p.add_argument("-f", "--follow", action="store_true", help="tail -f the given/default files")
@@ -593,8 +903,11 @@ def build_parser():
 
 
 def main(argv=None):
-    global _NO_COLOR
+    global _NO_COLOR, _MAX_LINES, _COMPACT
     args = build_parser().parse_args(argv)
+
+    _MAX_LINES = max(0, args.max_lines)
+    _COMPACT = args.compact
 
     if args.event:
         args.event = {e.strip() for e in args.event.split(",") if e.strip()}
