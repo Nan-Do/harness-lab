@@ -46,6 +46,7 @@ class MiniAgent:
         tool_profile: str = "standard",
         max_noisy_output: int = DEFAULT_MAX_NOISY_OUTPUT,
         require_read_before_overwrite: bool = True,
+        add_planning: bool = False,
     ) -> None:
         self.model_client = model_client
         self.workspace = workspace
@@ -61,6 +62,7 @@ class MiniAgent:
         self.tool_profile = tool_profile
         self.max_noisy_output = max_noisy_output
         self.require_read_before_overwrite = require_read_before_overwrite
+        self.add_planning = add_planning
         self.session = session or Session(
             id=datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
             created_at=now(),
@@ -192,6 +194,20 @@ class MiniAgent:
                 "- Required tool arguments must not be empty.",
             ]
         )
+        if self.add_planning:
+            rules += "\n".join(
+                [
+                    "",
+                    "Planning:",
+                    "- Break down the problem into logical requirements.",
+                    "- Outline the core algorithm, data structures, and edge cases to consider.",
+                    "- List the sequential steps you will take to implement the solution.",
+                    "Solution:",
+                    "- Implement the complete, clean code based on your plan.",
+                    "- Include any necessary execution details or usage examples.",
+                ]
+            )
+
         return "\n\n".join(
             [
                 "You are Harness Lab, a small local coding agent running through llama-server.",
@@ -268,7 +284,9 @@ class MiniAgent:
             if replaced.get(path, -1) > index:
                 stale.add(index)
                 continue
-            for later_index, later_path, later_start, later_end in reads[position + 1 :]:
+            for later_index, later_path, later_start, later_end in reads[
+                position + 1 :
+            ]:
                 if later_path != path:
                     continue
                 if cls._covers((later_start, later_end), (start, end)):
@@ -371,7 +389,9 @@ class MiniAgent:
                 total_chars=total,
                 budget_chars=self.history_budget,
             )
-            groups.insert(0, [{"role": "user", "content": self._eviction_notice(dropped)}])
+            groups.insert(
+                0, [{"role": "user", "content": self._eviction_notice(dropped)}]
+            )
         return groups
 
     def build_messages(self: Self, user_message: str) -> List[Dict]:
@@ -659,9 +679,7 @@ class MiniAgent:
                 # transcript but force a corrected retry.
                 if final:
                     self.record(
-                        MessageEntry(
-                            role="assistant", content=final, created_at=now()
-                        )
+                        MessageEntry(role="assistant", content=final, created_at=now())
                     )
                 self.record_retry(on_event, attempts, self.malformed_notice(response))
                 continue

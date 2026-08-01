@@ -35,15 +35,16 @@ def build_agent(args: argparse.Namespace) -> MiniAgent:
         logger=logger,
         stream=args.stream,
     )
-    options = dict(
-        approval_policy=args.approval,
-        max_steps=args.max_steps,
-        max_new_tokens=args.max_new_tokens,
-        logger=logger,
-        tool_profile=args.tools,
-        max_noisy_output=max(args.max_tool_output, 0),
-        require_read_before_overwrite=not args.no_write_guard,
-    )
+    options = {
+        "approval_policy": args.approval,
+        "max_steps": args.max_steps,
+        "max_new_tokens": args.max_new_tokens,
+        "logger": logger,
+        "tool_profile": args.tools,
+        "max_noisy_output": max(args.max_tool_output, 0),
+        "require_read_before_overwrite": not args.no_write_guard,
+        "add_planning": args.planning,
+    }
     session_id = args.resume
     if session_id == "latest":
         session_id = store.latest()
@@ -179,6 +180,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--no-log",
         action="store_true",
         help="Disable structured logging of memory, history, and llama-server traffic.",
+    )
+    parser.add_argument(
+        "--planning",
+        action="store_true",
+        help="Enable a dedicated step-by-step planning phase in the LLM's system prompt prior to code generation.",
     )
     return parser
 
