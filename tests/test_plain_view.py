@@ -16,7 +16,7 @@ from plain import PlainView
 FILE = "def add(a, b):\n    return a + b\n"
 
 
-def view() -> PlainView:
+def view(show_reasoning: bool = True) -> PlainView:
     console = Console(
         file=io.StringIO(),
         width=100,
@@ -25,7 +25,7 @@ def view() -> PlainView:
         no_color=True,
     )
     agent = SimpleNamespace(logger=SimpleNamespace(log=lambda *a, **k: None))
-    return PlainView(agent, console=console)
+    return PlainView(agent, console=console, show_reasoning=show_reasoning)
 
 
 def text(plain: PlainView) -> str:
@@ -51,6 +51,50 @@ def test_unstreamed_answer_is_still_printed():
 
     assert "answer>" in text(plain)
     assert "calc.py adds two numbers." in text(plain)
+
+
+def test_streamed_reasoning_is_shown_apart_from_the_answer():
+    plain = view()
+
+    plain.event("thinking")
+    plain.event("reasoning_delta", text="calc.py has ")
+    plain.event("reasoning_delta", text="one function.")
+    plain.event("assistant_delta", text="It adds two numbers.")
+    plain.event("reasoning", text="calc.py has one function.")
+    plain.event("final", text="It adds two numbers.")
+
+    printed = text(plain)
+    assert "think> calc.py has one function." in printed
+    assert "model> It adds two numbers." in printed
+    # Neither channel is printed twice by the events that report the whole turn.
+    assert printed.count("calc.py has one function.") == 1
+    assert printed.count("It adds two numbers.") == 1
+
+
+def test_unstreamed_reasoning_is_still_printed():
+    """--no-stream reports the turn's thinking only once it is over."""
+    plain = view()
+
+    plain.event("thinking")
+    plain.event("reasoning", text="calc.py has one function.")
+    plain.event("final", text="It adds two numbers.")
+
+    printed = text(plain)
+    assert "think> calc.py has one function." in printed
+    assert "answer> It adds two numbers." in printed
+
+
+def test_reasoning_can_be_turned_off():
+    plain = view(show_reasoning=False)
+
+    plain.event("thinking")
+    plain.event("reasoning_delta", text="calc.py has one function.")
+    plain.event("reasoning", text="calc.py has one function.")
+    plain.event("final", text="It adds two numbers.")
+
+    printed = text(plain)
+    assert "calc.py has one function." not in printed
+    assert "It adds two numbers." in printed
 
 
 def test_streamed_body_is_not_repeated_when_the_call_is_announced():

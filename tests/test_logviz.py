@@ -107,6 +107,26 @@ def test_continuation_renders_its_transcript_too():
     assert "You are harness-lab." in out
 
 
+def test_reasoning_is_shown_apart_from_what_the_model_said():
+    """A thinking model's log is mostly reasoning; labelling it as the answer
+    would misreport what the model actually committed to."""
+    event = {
+        "ts": "2026-07-31T16:36:41.500000",
+        "event": "llm_response",
+        "round": 1,
+        "finish_reason": "stop",
+        "reasoning": "main.py is short, so one read is enough.",
+        "content": "It prints hi.",
+    }
+
+    out = render(event, full=True)
+
+    assert "thinks:" in out
+    assert "main.py is short, so one read is enough." in out
+    assert "says:" in out
+    assert "It prints hi." in out
+
+
 def test_unparseable_arguments_are_shown_raw():
     """A call cut off by the token limit is exactly this shape; hiding it
     would hide the reason the run went wrong."""

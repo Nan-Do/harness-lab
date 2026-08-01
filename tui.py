@@ -29,6 +29,10 @@ _STREAM_REFRESH = 0.05
 # The live view is a peephole onto text still being written; it keeps the tail
 # in sight and lets the finished turn land in the log as a whole block.
 _STREAM_TAIL_LINES = 8
+# Prose arrives as one unbroken paragraph far more often than code does --
+# reasoning above all -- and a paragraph counts as a single line no matter how
+# far it wraps, so the tail is capped by characters as well.
+_STREAM_TAIL_CHARS = 600
 
 
 def _body_syntax(key: str, body: str, path: str) -> Syntax:
@@ -164,12 +168,14 @@ class MiniAgentApp(App):
         context: int,
         endpoint: str,
         prompt: str = "",
+        show_reasoning: bool = True,
     ) -> None:
         super().__init__()
         self.agent = agent
         self.model = model
         self.context = context
         self.endpoint = endpoint
+        self.show_reasoning = show_reasoning
         # A prompt given on the command line starts the session off; the TUI
         # then stays open for follow-ups instead of exiting like headless.
         self.initial_prompt = prompt.strip()
@@ -177,6 +183,7 @@ class MiniAgentApp(App):
         self._spinner_index = 0
         # Written from the agent worker thread, rendered from the UI thread.
         self._stream_text = ""
+        self._stream_reasoning = ""
         self._stream_call = ""
         self._stream_args = ""
         self._stream_painted = 0.0
@@ -303,12 +310,20 @@ class MiniAgentApp(App):
     def _streamview(self) -> Static:
         return self.query_one("#stream", Static)
 
+    @staticmethod
+    def _tail(text: str) -> str:
+        """The end of what is being written, sized to fit the live view."""
+        return "\n".join(text.splitlines()[-_STREAM_TAIL_LINES:])[-_STREAM_TAIL_CHARS:]
+
     def _render_stream(self) -> None:
         """Repaint the live view with the tail of what is being written.
 
         Once a tool call starts assembling, the call takes over the view: the
         file a write is building is what matters at that point, and seeing it
         arrive is what makes the approval question that follows answerable.
+        Reasoning holds the view only until the model starts answering, so a
+        long think block is visible while it happens without then sitting on
+        top of the answer it was leading to.
         """
         view = Text()
         if self._stream_args:
@@ -316,11 +331,14 @@ class MiniAgentApp(App):
             header = self._stream_call or "tool call"
             if body:
                 view.append(f"{header} · {key}\n", style="bold")
-                view.append("\n".join(body.splitlines()[-_STREAM_TAIL_LINES:]))
+                view.append(self._tail(body))
             else:
                 view.append(f"{header}…", style="bold")
+        elif self._stream_text.strip() or not self._reasoning_stream():
+            view.append(self._tail(self._stream_text))
         else:
-            view.append("\n".join(self._stream_text.splitlines()[-_STREAM_TAIL_LINES:]))
+            view.append("thinking…\n", style="bold")
+            view.append(self._tail(self._stream_reasoning), style="italic")
 
         if not view.plain.strip():
             self._streamview.display = False
@@ -328,8 +346,13 @@ class MiniAgentApp(App):
         self._streamview.update(view)
         self._streamview.display = True
 
+    def _reasoning_stream(self) -> str:
+        """The thinking to show, or "" when it is turned off or absent."""
+        return self._stream_reasoning if self.show_reasoning else ""
+
     def _reset_stream(self) -> None:
         self._stream_text = ""
+        self._stream_reasoning = ""
         self._stream_call = ""
         self._stream_args = ""
         self._streamview.update("")
@@ -339,12 +362,23 @@ class MiniAgentApp(App):
         """Close out the live view once the model turn is decided.
 
         A turn that ends in a tool call is the model thinking out loud on its
-        way to acting; `commit` keeps that text in the log so the reasoning
-        survives after the live view is gone. The final answer is committed by
-        `_write_agent` instead, so it is not written twice.
+        way to acting; `commit` keeps that text in the log so the plan survives
+        after the live view is gone. The final answer is committed by
+        `_write_agent` instead, so it is not written twice -- but the model's
+        reasoning is never part of that answer, so it is always kept.
         """
         text = self._stream_text.strip()
+        reasoning = self._reasoning_stream().strip()
         self._reset_stream()
+        if reasoning:
+            self._logview.write(
+                Panel(
+                    Text(reasoning),
+                    title="Agent · Reasoning",
+                    border_style="dim magenta",
+                    title_align="left",
+                )
+            )
         if commit and text:
             self._logview.write(
                 Panel(
@@ -440,6 +474,12 @@ class MiniAgentApp(App):
             self._on_stream_delta(
                 call=data.get("name", ""), args=data.get("args_text", "")
             )
+        elif event_type == "reasoning_delta":
+            self._on_stream_delta(reasoning=data.get("text", ""))
+        elif event_type == "reasoning":
+            # The turn's thinking in full: the only source of it when the run
+            # is not streamed, and identical to what streamed when it is.
+            self.call_from_thread(self._set_reasoning, data.get("text", ""))
         elif event_type == "thinking":
             self.call_from_thread(self._reset_stream)
         elif event_type == "tool_call":
@@ -468,7 +508,14 @@ class MiniAgentApp(App):
             self.call_from_thread(self._end_stream, False)
             self.call_from_thread(self._write_agent, data.get("text", ""))
 
-    def _on_stream_delta(self, text: str = "", call: str = "", args: str = "") -> None:
+    def _set_reasoning(self, text: str) -> None:
+        """Take the turn's reasoning as a whole, replacing what streamed."""
+        if text:
+            self._stream_reasoning = text
+
+    def _on_stream_delta(
+        self, text: str = "", reasoning: str = "", call: str = "", args: str = ""
+    ) -> None:
         """Buffer streamed output on the worker thread, repainting on a tick.
 
         Every repaint is a cross-thread hop, so output accumulates between
@@ -478,6 +525,8 @@ class MiniAgentApp(App):
         """
         if text:
             self._stream_text += text
+        if reasoning:
+            self._stream_reasoning += reasoning
         if call or args:
             self._stream_call = call or self._stream_call
             self._stream_args = args
@@ -525,6 +574,7 @@ def run_tui(
     context: int,
     endpoint: str,
     prompt: str = "",
+    show_reasoning: bool = True,
 ) -> int:
     MiniAgentApp(
         agent,
@@ -532,5 +582,6 @@ def run_tui(
         context=context,
         endpoint=endpoint,
         prompt=prompt,
+        show_reasoning=show_reasoning,
     ).run()
     return 0

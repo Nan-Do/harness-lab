@@ -111,6 +111,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--reasoning",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Show the model's reasoning (thinking) in the TUI and plain mode, "
+            "separately from its answer. Reasoning is never sent back to the "
+            "model either way; use --no-reasoning for a quieter transcript."
+        ),
+    )
+    parser.add_argument(
         "--resume", default=None, help="Session id to resume or 'latest'."
     )
     parser.add_argument(
@@ -238,7 +248,7 @@ def main() -> int:
         return run_headless(agent, prompt)
 
     if mode == "plain":
-        return run_plain(agent, prompt, endpoint)
+        return run_plain(agent, prompt, endpoint, show_reasoning=args.reasoning)
 
     return run_tui(
         agent,
@@ -246,6 +256,7 @@ def main() -> int:
         context=agent.model_client.ctx,
         endpoint=endpoint,
         prompt=prompt,
+        show_reasoning=args.reasoning,
     )
 
 

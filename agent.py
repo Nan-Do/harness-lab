@@ -529,16 +529,18 @@ class MiniAgent:
 
     def _stream_sinks(
         self: Self, on_event: Callable[..., None] | None
-    ) -> tuple[Callable | None, Callable | None]:
-        """Bridge streamed output to the front-end, as text and as tool calls.
+    ) -> tuple[Callable | None, Callable | None, Callable | None]:
+        """Bridge streamed output to the front-end: text, tool calls, thinking.
 
-        Both are None when nobody is listening, so a headless or delegated run
-        doesn't pay for a callback per token. The tool sink carries the raw
+        All three are None when nobody is listening, so a headless or delegated
+        run doesn't pay for a callback per token. The tool sink carries the raw
         arguments assembled so far -- a front-end that wants to show the file
-        being written decodes it with `tool_support.streaming_body`.
+        being written decodes it with `tool_support.streaming_body`. Reasoning
+        arrives on its own sink so a front-end can render the model's thinking
+        apart from what it is actually saying.
         """
         if on_event is None:
-            return None, None
+            return None, None, None
 
         def on_text(text: str) -> None:
             self._emit(on_event, "assistant_delta", text=text)
@@ -546,7 +548,10 @@ class MiniAgent:
         def on_tool(name: str, args_text: str) -> None:
             self._emit(on_event, "tool_delta", name=name, args_text=args_text)
 
-        return on_text, on_tool
+        def on_reasoning(text: str) -> None:
+            self._emit(on_event, "reasoning_delta", text=text)
+
+        return on_text, on_tool, on_reasoning
 
     def ask(
         self: Self,
@@ -584,13 +589,14 @@ class MiniAgent:
                 ),
                 memory_text=self.memory_text(),
             )
-            on_text, on_tool = self._stream_sinks(on_event)
+            on_text, on_tool, on_reasoning = self._stream_sinks(on_event)
             response = self.model_client.complete(
                 messages,
                 self.max_new_tokens,
                 tools=self.tools.schemas(),
                 on_delta=on_text,
                 on_tool_delta=on_tool,
+                on_reasoning_delta=on_reasoning,
             )
             self.logger.log(
                 "model_output",
@@ -601,8 +607,15 @@ class MiniAgent:
                     {"name": bad.name, "error": bad.error}
                     for bad in response.malformed_tool_calls
                 ],
+                reasoning=response.reasoning,
                 content=response.content,
             )
+            # The whole turn's thinking, for a front-end that had nothing to
+            # stream (--no-stream) or wants to render it as one block. It is
+            # deliberately not recorded in the session: reasoning is for the
+            # reader, and feeding it back would spend context re-reading it.
+            if response.reasoning.strip():
+                self._emit(on_event, "reasoning", text=response.reasoning.strip())
 
             if response.malformed_tool_calls:
                 for bad in response.malformed_tool_calls:

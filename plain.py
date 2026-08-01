@@ -2,10 +2,10 @@
 
 Headless mode prints the answer and nothing else, which is what you want in a
 pipeline and useless when the question is *how* the model got there. This mode
-prints the conversation the TUI shows -- streamed model text, each tool call
-with the body it carries, each result, every corrective notice -- as ordinary
-text, so a run can be read in a terminal, piped into a file, or diffed against
-another run without going through the JSONL log.
+prints the conversation the TUI shows -- the model's thinking, its streamed
+text, each tool call with the body it carries, each result, every corrective
+notice -- as ordinary text, so a run can be read in a terminal, piped into a
+file, or diffed against another run without going through the JSONL log.
 
 Rich is used only for styling: attached to a terminal it colors the trace, and
 redirected to a file it writes plain text.
@@ -27,9 +27,15 @@ from utils import HELP_DETAILS
 class PlainView:
     """Renders agent events as a readable plain-text transcript."""
 
-    def __init__(self, agent: MiniAgent, console: Console | None = None) -> None:
+    def __init__(
+        self,
+        agent: MiniAgent,
+        console: Console | None = None,
+        show_reasoning: bool = True,
+    ) -> None:
         self.agent = agent
         self.console = console or Console(soft_wrap=True, highlight=False)
+        self.show_reasoning = show_reasoning
         self._reset_turn()
 
     def _reset_turn(self) -> None:
@@ -40,6 +46,10 @@ class PlainView:
         not left out.
         """
         self._streamed_text = False
+        self._streamed_reasoning = False
+        # Which channel wrote last: a turn can cross between thinking and
+        # answering more than once, and each crossing needs its own header.
+        self._channel = ""
         self._body_key = ""
         self._body_shown = ""
         self._streamed_keys: set[str] = set()
@@ -48,7 +58,9 @@ class PlainView:
     # --- Output helpers ----------------------------------------------------
 
     def _line(self, text: str, style: str = "") -> None:
+        """Emit a whole line, which closes whatever channel was mid-line."""
         self.console.print(Text(text, style=style))
+        self._channel = ""
 
     def _write(self, text: str, style: str = "") -> None:
         """Emit text with no line break, for output still being generated."""
@@ -90,10 +102,11 @@ class PlainView:
         if event_type == "thinking":
             self._reset_turn()
         elif event_type == "assistant_delta":
-            if not self._streamed_text:
-                self._write("\nmodel> ", "bold green")
-                self._streamed_text = True
-            self._write(data.get("text", ""))
+            self._on_assistant_delta(data.get("text", ""))
+        elif event_type == "reasoning_delta":
+            self._on_reasoning_delta(data.get("text", ""))
+        elif event_type == "reasoning":
+            self._on_reasoning(data.get("text", ""))
         elif event_type == "tool_delta":
             self._on_tool_delta(data.get("name", ""), data.get("args_text", ""))
         elif event_type == "tool_call":
@@ -110,6 +123,41 @@ class PlainView:
             self._line(f"\n  ! retrying: {data.get('notice', '')}", "yellow")
         elif event_type == "final":
             self._on_final(data.get("text", ""))
+
+    def _open_channel(self, channel: str, header: str, style: str) -> None:
+        """Start a line for `channel`, unless it is already the one writing."""
+        if self._channel == channel:
+            return
+        self._write(header, style)
+        self._channel = channel
+
+    def _on_assistant_delta(self, text: str) -> None:
+        if not text:
+            return
+        self._open_channel("model", "\nmodel> ", "bold green")
+        self._streamed_text = True
+        self._write(text)
+
+    def _on_reasoning_delta(self, text: str) -> None:
+        """Print the model's thinking as it arrives, under its own header.
+
+        Dimmed and labelled apart from `model>` on purpose: reasoning is how
+        the answer was reached, not the answer, and a transcript that blurs the
+        two is misread as the model saying all of it out loud.
+        """
+        if not self.show_reasoning or not text:
+            return
+        self._open_channel("think", "\nthink> ", "bold magenta")
+        self._streamed_reasoning = True
+        self._write(text, "dim")
+
+    def _on_reasoning(self, text: str) -> None:
+        """Print thinking that never streamed (--no-stream), as one block."""
+        if not self.show_reasoning or self._streamed_reasoning or not text:
+            return
+        self._streamed_reasoning = True
+        self._open_channel("think", "\nthink> ", "bold magenta")
+        self._line(text, "dim")
 
     def _on_tool_delta(self, name: str, args_text: str) -> None:
         """Print a call's body as the model writes it.
@@ -136,6 +184,7 @@ class PlainView:
     def _on_tool_call(self, name: str, args: Dict[str, Any]) -> None:
         inline, bodies = split_args(args)
         labels = " ".join(f"{key}={value}" for key, value in inline)
+        self._channel = ""
         self.console.print(
             Text.assemble(
                 ("\n  → ", "bold blue"),
@@ -197,9 +246,11 @@ class PlainView:
         return True
 
 
-def run_plain(agent: MiniAgent, prompt: str, endpoint: str) -> int:
+def run_plain(
+    agent: MiniAgent, prompt: str, endpoint: str, show_reasoning: bool = True
+) -> int:
     """One-shot with a prompt, or a read-ask loop on an interactive terminal."""
-    view = PlainView(agent)
+    view = PlainView(agent, show_reasoning=show_reasoning)
     view.banner(endpoint)
 
     if prompt:

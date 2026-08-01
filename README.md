@@ -21,7 +21,7 @@ diff the two runs to see what the change actually did.
 | `agent.py` | The agent loop: builds prompts, calls the model, runs tools, tracks memory |
 | `tools.py` | Tool catalog, JSON-schema generation, approval gating, path sandboxing, write safety |
 | `tool_support.py` | Repairing malformed tool calls, tool/argument aliases, patch diagnostics, output shaping |
-| `model_clients.py` | OpenAI-compatible client for `llama-server`: streamed and whole completions, tool-call parsing |
+| `model_clients.py` | OpenAI-compatible client for `llama-server`: streamed and whole completions, tool-call parsing, reasoning extraction |
 | `app_types.py` | Dataclasses shared across the codebase (history entries, tool calls, session) |
 | `workspace.py` | One-shot collection of repo facts (branch, status, recent commits, project docs) |
 | `session.py` | Loads/saves session transcripts as JSON under `.harness-lab/sessions/` |
@@ -56,7 +56,8 @@ diff the two runs to see what the change actually did.
   as it is generated and text is handed to the front-end token by token;
   otherwise it is read in one piece. Either way the agent loop only sees a
   finished turn, so streaming changes when you see the answer, not how it is
-  decided.
+  decided. A thinking model's reasoning is separated from its answer here and
+  carried on a channel of its own (see [Reasoning](#reasoning)).
 - **Tools** (`tools.py`) — the model acts only through named, schema-checked
   tools (see the table below). Every path argument is resolved and checked
   against the workspace root so a tool can't escape it.
@@ -311,6 +312,9 @@ python main.py --help
 - `--stream` / `--no-stream` — stream tokens from `llama-server` as they are
   generated instead of waiting for the whole completion; default on. See
   [Streaming](#streaming)
+- `--reasoning` / `--no-reasoning` — show the model's thinking in the TUI and
+  plain mode, separately from its answer; default on. See
+  [Reasoning](#reasoning)
 - `--resume` — resume a saved session by id, or `latest`; default: start a
   new session
 - `--approval` — `ask`, `auto`, or `never`; default `ask`
@@ -339,7 +343,10 @@ ended it:
 - a **final answer** is rendered as the usual `agent` panel in the log
 - text that preceded a **tool call** (the model thinking out loud on its way
   to acting) is committed to the log as an `agent · thinking` panel, so the
-  reasoning stays readable after the live view is gone
+  plan stays readable after the live view is gone
+- a thinking model's **reasoning** streams on a channel of its own and lands
+  in an `agent · reasoning` panel, whichever way the turn ended (see
+  [Reasoning](#reasoning))
 - text cut short by an **error** mid-generation is kept too — it is the only
   record of how far the model got
 
@@ -375,12 +382,62 @@ Notes:
 
 &nbsp;
 
+## Reasoning
+
+Thinking models spend most of a turn reasoning before they say anything, and
+on a small local model that reasoning is often the only explanation of why the
+next tool call is what it is. The harness treats it as a channel of its own —
+shown, but never confused with the answer.
+
+It arrives from the server one of two ways, and which one depends on how
+`llama-server` was started, not on the model:
+
+- **as its own field** on the message or delta (`reasoning_content`, or
+  `reasoning` / `thinking` on other backends) — what you get with
+  `--reasoning-format deepseek`, the default for templates that support it
+- **inline in the content**, wrapped in the `<think>` … `</think>` tags the
+  model emits — what you get with `--reasoning-format none`, or from a server
+  that doesn't parse reasoning at all
+
+`model_clients.py` normalizes both (`reasoning_field` and `ThinkSplitter`), so
+a front-end sees the same thing either way: reasoning on `reasoning_delta`
+while it is being written, then a `reasoning` event with the whole turn's
+thinking once the turn is decided. Tags never reach a front-end, and inline
+reasoning no longer lands in the answer — `final`, the session transcript, and
+the model's own history hold what it said, not what it thought.
+
+Where it shows up:
+
+- **TUI** — the live view shows `thinking…` with the tail of the reasoning
+  while it arrives, and hands the view over to the answer (or to the body of
+  a tool call) as soon as one starts. The finished reasoning is committed to
+  the log as an `Agent · Reasoning` panel, kept even when the turn ends in a
+  final answer, since the answer panel never contains it.
+- **Plain mode** — a dimmed `think>` block, printed apart from the `model>`
+  text it led to. A turn that crosses between the two more than once gets a
+  fresh header each time, so the transcript stays readable when redirected to
+  a file.
+- **Headless mode** — unchanged: it prints the final answer and nothing else,
+  so piping it stays scriptable.
+
+Reasoning is shown, not remembered: it is never sent back to the model and is
+not written to the session transcript, so a long think block costs nothing in
+context on the next step. (The plain text a model writes *before a tool call*
+is a different thing — that is ordinary content, and it is kept and replayed;
+see `assistant_text` in `app_types.py`.)
+
+`--no-reasoning` hides it in both front-ends. It is still logged either way:
+`llm_response` and `model_output` carry a `reasoning` field, and the log
+viewer prints it as `thinks:` above what the model said.
+
+&nbsp;
+
 ## Plain mode
 
 `--mode plain` runs a request the way headless mode does, but prints the whole
-interaction instead of only the answer: the model's text as it is generated,
-every tool call with the body it carries, every result, and every corrective
-notice sent back to the model.
+interaction instead of only the answer: the model's reasoning and text as they
+are generated, every tool call with the body it carries, every result, and
+every corrective notice sent back to the model.
 
 ```bash
 uv run harness-lab --mode plain "add a docstring to calc.py"
@@ -391,6 +448,8 @@ harness-lab · plain mode
 model Qwen3.5-4B-Q4_K_M.gguf · endpoint 127.0.0.1:8080 · workspace /tmp/demo · approval ask
 
 you> Create greet.py with a function greet(name) returning a greeting string.
+
+think> A new file with one function; write_file covers it in a single call.
 
   ⋯ write_file
 def greet(name):
@@ -415,7 +474,9 @@ model> Done. Created `greet.py` with a `greet(name)` function.
   logs, without a viewer.
 - Nothing is deliberately hidden and nothing is clipped, which makes it the
   mode to reach for when a small model is doing something inexplicable and the
-  TUI's panels are in the way.
+  TUI's panels are in the way. `--no-reasoning` is the one thing that trims
+  it, for a transcript of what the model did without how it talked itself
+  into it.
 
 `--mode plain` is never chosen by `auto`: its extra output would surprise
 anything piping the answer somewhere, so it is always an explicit request.
@@ -494,7 +555,8 @@ and exchanges, in order:
   for that step
 - `llm_request` / `llm_response` / `llm_continuation` — the raw messages,
   model params, and completions exchanged with the `llama-server` backend,
-  including whether the round was streamed
+  including whether the round was streamed and the `reasoning` the model
+  produced for it
 - `tool_call` / `tool_result` — tool invocations and their output
 - `tool_outcome` — how each call ended (`ok`, `arg_error`, `not_found`,
   `no_match`, `denied`, `guard_blocked`, `repeated`, `unknown_tool`), which
@@ -553,6 +615,9 @@ output quality, here's where each piece lives:
   `--temperature`, `--top-p`
 - **Transport** — `--stream` / `--no-stream`; changes when output is visible,
   and is worth flipping when a backend's streamed tool calls look suspect
+- **Visible thinking** — `--reasoning` / `--no-reasoning`; changes only what
+  the front-end shows, since reasoning is logged either way and never reaches
+  the next prompt
 - **Friction on risky actions** — `--approval`; `--mode plain` makes a whole
   run readable as text when the question is why a change was approved
 

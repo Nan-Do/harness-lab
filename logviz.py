@@ -489,6 +489,10 @@ def render_llm_response(d, w, full):
             lines.extend(
                 text_lines(mc["raw_args"], w, full, gutter="  | ", codes=(C.RED,))
             )
+    if d.get("reasoning"):
+        lines.extend(
+            labeled_text(col("thinks:", C.MAGENTA), d["reasoning"], w, full, gutter="  ")
+        )
     if d.get("content"):
         lines.extend(
             labeled_text(col("says:", C.YELLOW), d["content"], w, full, gutter="  ")
@@ -506,6 +510,10 @@ def render_model_output(d, w, full):
         lines.append(
             col("malformed: ", C.RED)
             + f"{mc.get('name')}: {truncate(mc.get('error'), w, full)}"
+        )
+    if d.get("reasoning"):
+        lines.extend(
+            labeled_text(col("thinks:", C.MAGENTA), d["reasoning"], w, full, gutter="  ")
         )
     if d.get("content"):
         lines.extend(text_lines(d.get("content"), w, full))

@@ -65,6 +65,9 @@ class ModelResponse:
     # True when generation stopped at the token limit mid tool call, so the
     # arguments are cut off rather than genuinely malformed.
     truncated: bool = False
+    # The model's thinking for this turn, kept apart from `content`: it is
+    # shown to the user but never sent back as part of the next prompt.
+    reasoning: str = ""
 
 
 HistoryEntry: TypeAlias = Union[MessageEntry, ToolMessageEntry]
