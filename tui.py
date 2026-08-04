@@ -19,8 +19,9 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Header, Input, RichLog, Static
 
 from agent import MiniAgent
+from app_types import ContextUsage
 from tool_support import size_note, split_args, streaming_body
-from utils import HELP_DETAILS, APP_NAME
+from utils import HELP_DETAILS, APP_NAME, format_context
 
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 # Repainting on every token would spend more time in the UI than in the model,
@@ -181,6 +182,9 @@ class MiniAgentApp(App):
         self.initial_prompt = prompt.strip()
         self._busy = False
         self._spinner_index = 0
+        # How full the window was for the last prompt sent; the model's own
+        # context size until a request has gone out to measure against it.
+        self._usage = ContextUsage(limit=context)
         # Written from the agent worker thread, rendered from the UI thread.
         self._stream_text = ""
         self._stream_reasoning = ""
@@ -217,15 +221,27 @@ class MiniAgentApp(App):
         return self.query_one("#log", RichLog)
 
     def _status_text(self) -> str:
+        """The one line that is always on screen, so it carries the context.
+
+        How full the window is changes with every step and is the thing you
+        want to see *while* a run is going -- a request that is about to start
+        dropping turns looks no different until it does -- so it stays on the
+        line whether the agent is working or waiting.
+        """
+        context = format_context(self._usage)
         if self._busy:
             frame = _SPINNER[self._spinner_index % len(_SPINNER)]
-            return f"{frame} working…"
+            return f"{frame} working…   {context}"
         return (
-            f"● ready   model {self.model} · ctx {self.context} · "
+            f"● ready   model {self.model} · {context} · "
             f"branch {self.agent.workspace.branch} · "
             f"approval {self.agent.approval_policy} · "
             f"session {self.agent.session.id}"
         )
+
+    def _set_context(self, usage: ContextUsage) -> None:
+        self._usage = usage
+        self._refresh_status()
 
     def _refresh_status(self) -> None:
         self.query_one("#status", Static).update(self._status_text())
@@ -244,6 +260,7 @@ class MiniAgentApp(App):
                     ("Status: \n", "bold cyan"),
                     (f"workspace  {self.agent.workspace.cwd}\n", ""),
                     (f"model      {self.model}\n", ""),
+                    (f"context    {self.context or 'unknown'} tokens\n", ""),
                     (f"endpoint   {self.endpoint}\n", ""),
                     (f"approval   {self.agent.approval_policy}\n", ""),
                     ("\nType a request and press Enter. /help lists commands.", "dim"),
@@ -480,6 +497,10 @@ class MiniAgentApp(App):
             # The turn's thinking in full: the only source of it when the run
             # is not streamed, and identical to what streamed when it is.
             self.call_from_thread(self._set_reasoning, data.get("text", ""))
+        elif event_type == "context":
+            # Both phases: the estimate as the prompt goes out, then the
+            # server's own count when the turn lands.
+            self.call_from_thread(self._set_context, data["usage"])
         elif event_type == "thinking":
             self.call_from_thread(self._reset_stream)
         elif event_type == "tool_call":

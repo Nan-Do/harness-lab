@@ -10,9 +10,11 @@ from tools import READ_TOOLS, WRITE_TOOLS, ToolRegistry
 from typing import Callable, Dict, List, Self
 from workspace import WorkspaceContext
 from app_types import (
+    ContextUsage,
     HistoryEntry,
     Memory,
     MessageEntry,
+    ModelResponse,
     Session,
     ToolMessageEntry,
 )
@@ -109,17 +111,24 @@ class MiniAgent:
         # What has to be held back is measured rather than guessed: the tool
         # schemas alone run to thousands of tokens and grow with --tools, so a
         # fixed reserve would quietly overcommit the window on the larger
-        # profiles and overflow the model's real context.
-        overhead_chars = len(self.prefix) + len(json.dumps(self.tools.schemas()))
+        # profiles and overflow the model's real context. The schemas ride
+        # along with every request, so they count against the window even
+        # though they are never part of `messages`.
+        self.context_limit = getattr(model_client, "ctx", 0)
+        self.schema_chars = len(json.dumps(self.tools.schemas()))
+        overhead_chars = len(self.prefix) + self.schema_chars
         reserve_tokens = (
             self.max_new_tokens + int(overhead_chars / CHARS_PER_TOKEN) + 500
         )
         self.history_budget = context_chars(
-            getattr(model_client, "ctx", 0), reserve_tokens, DEFAULT_HISTORY_BUDGET
+            self.context_limit, reserve_tokens, DEFAULT_HISTORY_BUDGET
         )
+        # What the front-ends show: how full the window was for the last
+        # prompt sent. Empty until the first request goes out.
+        self.context_usage = ContextUsage(limit=self.context_limit)
         self.logger.log(
             "context_budget",
-            n_ctx=getattr(model_client, "ctx", 0),
+            n_ctx=self.context_limit,
             tool_profile=self.tool_profile,
             tool_count=len(self.tools.schemas()),
             overhead_chars=overhead_chars,
@@ -527,6 +536,60 @@ class MiniAgent:
             # The UI callback must never break the agent loop.
             self.logger.log("event_callback_error", event_type=event_type)
 
+    def _estimate_tokens(self: Self, chars: int) -> int:
+        """Characters as tokens, for when the server reports no usage.
+
+        CHARS_PER_TOKEN errs low on characters per token, so this errs high on
+        tokens -- the safe direction for a fullness reading nobody wants to
+        find out was optimistic.
+        """
+        return int(chars / CHARS_PER_TOKEN)
+
+    def _note_context(
+        self: Self,
+        on_event: Callable[..., None] | None,
+        messages: List[Dict],
+        response: ModelResponse | None = None,
+    ) -> ContextUsage:
+        """Record how full the context window is and tell the front-end.
+
+        Called twice a step: once with the prompt just built, so a UI can show
+        what is being sent while the model is still working on it, and again
+        with the finished turn, when the server's own token counts replace the
+        estimate. `phase` says which of the two a front-end is looking at --
+        the TUI follows both, a transcript only wants the measured one.
+        """
+        counts = (response.usage if response else None) or {}
+        prompt_tokens = int(counts.get("prompt_tokens") or 0)
+        completion_tokens = int(counts.get("completion_tokens") or 0)
+        if not prompt_tokens:
+            prompt_tokens = self._estimate_tokens(
+                self._group_chars(messages) + self.schema_chars
+            )
+            if response is not None:
+                completion_tokens = self._estimate_tokens(
+                    len(response.content) + len(response.reasoning)
+                )
+        usage = ContextUsage(
+            limit=self.context_limit,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            estimated=not counts.get("prompt_tokens"),
+        )
+        self.context_usage = usage
+        phase = "response" if response is not None else "prompt"
+        self.logger.log(
+            "context_usage",
+            phase=phase,
+            n_ctx=usage.limit,
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            percent=round(usage.percent, 1),
+            estimated=usage.estimated,
+        )
+        self._emit(on_event, "context", usage=usage, phase=phase)
+        return usage
+
     def _stream_sinks(
         self: Self, on_event: Callable[..., None] | None
     ) -> tuple[Callable | None, Callable | None, Callable | None]:
@@ -589,6 +652,7 @@ class MiniAgent:
                 ),
                 memory_text=self.memory_text(),
             )
+            self._note_context(on_event, messages)
             on_text, on_tool, on_reasoning = self._stream_sinks(on_event)
             response = self.model_client.complete(
                 messages,
@@ -616,6 +680,9 @@ class MiniAgent:
             # reader, and feeding it back would spend context re-reading it.
             if response.reasoning.strip():
                 self._emit(on_event, "reasoning", text=response.reasoning.strip())
+            # After the turn's output, so a transcript reads "here is what the
+            # model said, and here is what it cost" rather than the reverse.
+            self._note_context(on_event, messages, response)
 
             if response.malformed_tool_calls:
                 for bad in response.malformed_tool_calls:

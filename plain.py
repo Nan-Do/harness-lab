@@ -20,8 +20,9 @@ from rich.console import Console
 from rich.text import Text
 
 from agent import MiniAgent
+from app_types import ContextUsage
 from tool_support import size_note, split_args, streaming_body
-from utils import HELP_DETAILS
+from utils import HELP_DETAILS, compact_tokens, format_context
 
 
 class PlainView:
@@ -71,6 +72,7 @@ class PlainView:
         self._line("harness-lab · plain mode", "bold cyan")
         self._line(
             f"model {agent.model_client.model} · endpoint {endpoint} · "
+            f"context {agent.context_limit or 'unknown'} tokens · "
             f"workspace {agent.workspace.cwd} · approval {agent.approval_policy}",
             "dim",
         )
@@ -107,6 +109,8 @@ class PlainView:
             self._on_reasoning_delta(data.get("text", ""))
         elif event_type == "reasoning":
             self._on_reasoning(data.get("text", ""))
+        elif event_type == "context":
+            self._on_context(data.get("usage"), data.get("phase", ""))
         elif event_type == "tool_delta":
             self._on_tool_delta(data.get("name", ""), data.get("args_text", ""))
         elif event_type == "tool_call":
@@ -158,6 +162,20 @@ class PlainView:
         self._streamed_reasoning = True
         self._open_channel("think", "\nthink> ", "bold magenta")
         self._line(text, "dim")
+
+    def _on_context(self, usage: ContextUsage | None, phase: str) -> None:
+        """Print how full the window was for this step, once per model turn.
+
+        Only the measured phase is printed: the estimate that goes out with the
+        prompt exists so a live UI has something to show while the model is
+        working, and a transcript that repeated it would say everything twice.
+        """
+        if usage is None or phase != "response":
+            return
+        line = f"\n  {format_context(usage)}"
+        if usage.completion_tokens:
+            line += f" · {compact_tokens(usage.completion_tokens)} out"
+        self._line(line, "dim")
 
     def _on_tool_delta(self, name: str, args_text: str) -> None:
         """Print a call's body as the model writes it.

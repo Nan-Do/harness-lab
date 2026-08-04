@@ -100,6 +100,7 @@ EVENT_STYLE = {
     "tool_args_normalized": ("ARGS FIX", (C.GRAY,)),
     "malformed_tool_call": ("MALFORMED", (C.RED,)),
     "context_budget": ("BUDGET", (C.GRAY,)),
+    "context_usage": ("CTX", (C.GRAY,)),
     "history_window": ("EVICTED", (C.YELLOW,)),
     "repl_command": ("COMMAND", (C.CYAN,)),
     "repl_error": ("REPL ERR", (C.RED,)),
@@ -125,6 +126,10 @@ VERBOSE_EVENTS = {
     "prompt_built",
     "llm_request",
     "model_output",
+    # Two readings a step, the second of which is the `usage` llm_response
+    # already carries; ask for them with --event context_usage when the
+    # question is how full the window got.
+    "context_usage",
 }
 
 SESSION_START_EVENTS = {"session_start"}

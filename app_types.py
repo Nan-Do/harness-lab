@@ -68,6 +68,33 @@ class ModelResponse:
     # The model's thinking for this turn, kept apart from `content`: it is
     # shown to the user but never sent back as part of the next prompt.
     reasoning: str = ""
+    # Token counts as the server reported them ({"prompt_tokens": ...}), or
+    # None from a backend that doesn't send usage at all.
+    usage: Dict[str, Any] | None = None
+
+
+@dataclass
+class ContextUsage:
+    """How full the model's context window was for the last prompt sent.
+
+    `limit` is the model's own `n_ctx`, 0 when the backend doesn't report one.
+    `prompt_tokens` is the whole prompt -- system rules, tool schemas, and
+    whatever history survived the budget -- which is what "used" means here:
+    the room the conversation is taking up before the model writes anything.
+    `estimated` marks counts derived from characters because the server sent
+    no usage, so a guess is never shown as a measurement.
+    """
+
+    limit: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    estimated: bool = True
+
+    @property
+    def percent(self) -> float:
+        if self.limit <= 0:
+            return 0.0
+        return 100.0 * self.prompt_tokens / self.limit
 
 
 HistoryEntry: TypeAlias = Union[MessageEntry, ToolMessageEntry]

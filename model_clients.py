@@ -396,6 +396,12 @@ class LlamaCppModelClient:
         reasoning_message = ""
         tool_calls: list[ToolCall] = []
         malformed_tool_calls: list[MalformedToolCall] = []
+        # The last round that reported token counts, kept so the caller can
+        # show how full the context window is. A continuation round measures
+        # the same conversation plus what has been written since, so the
+        # latest one is the one to keep; it stays None on a backend that
+        # doesn't report usage.
+        last_usage: dict | None = None
         truncated = False
         round_index = 0
         has_more_data = True
@@ -423,6 +429,7 @@ class LlamaCppModelClient:
             tool_calls, malformed_tool_calls = self.__parse_tool_calls(turn.tool_calls)
             finish_reason = turn.finish_reason
             usage = turn.usage
+            last_usage = usage or last_usage
             self.logger.log(
                 "llm_response",
                 round=round_index,
@@ -478,4 +485,5 @@ class LlamaCppModelClient:
             malformed_tool_calls=malformed_tool_calls,
             truncated=truncated,
             reasoning=reasoning_message,
+            usage=last_usage,
         )

@@ -378,7 +378,8 @@ Notes:
   log records which transport produced it.
 - Token counts for a streamed round come from `stream_options:
   {"include_usage": true}`; a server that doesn't send that final usage chunk
-  logs `usage: null` while everything else keeps working.
+  logs `usage: null` while everything else keeps working — the context
+  display falls back to an estimate (see [Context usage](#context-usage)).
 
 &nbsp;
 
@@ -432,6 +433,43 @@ viewer prints it as `thinks:` above what the model said.
 
 &nbsp;
 
+## Context usage
+
+The context window is the resource a run actually runs out of, and it runs
+out quietly: once the prompt stops fitting, whole turns are dropped
+(`history_window`) and the only symptom is a model that has forgotten
+something it read. So every mode that shows anything shows how full the
+window is, beside how big it is:
+
+- **TUI** — on the status bar, idle and working alike:
+  `⠹ working…   ctx 6.2k/32k (19%)`. It moves twice a step — an estimate when
+  the prompt goes out, so the number is current while the model is still
+  generating, then the server's own count when the turn lands.
+- **Plain mode** — a dim line after each model turn, with what that turn
+  generated: `ctx 6.2k/32k (19%) · 412 out`. The startup banner names the
+  window itself (`context 32768 tokens`).
+- **Headless mode** — unchanged: it prints the final answer and nothing else,
+  so piping it stays scriptable. The numbers are in the run log either way.
+
+What is counted as used is the prompt that was sent — the system rules, the
+tool schemas, and whatever history survived the budget — since that is what
+the conversation occupies before the model writes a token.
+
+The counts come from the backend's own `usage` (a streamed round asks for it
+with `stream_options: {"include_usage": true}`). A server that reports none
+does not leave the display blank: the count is estimated from characters and
+marked with a `~` — `ctx ~6.2k/32k (19%)` — so a guess is never read as a
+measurement. The estimate deliberately errs high, on the same
+characters-per-token ratio the history budget is sized with. If `n_ctx` is
+unknown too, only what was sent is shown (`ctx 6.2k tokens`): a percentage of
+an unknown window would be invented.
+
+Every reading is logged as `context_usage` — phase, `n_ctx`, prompt and
+completion tokens, percentage, and whether it was estimated — so "how full
+did this run get, and when" is comparable across runs like everything else.
+
+&nbsp;
+
 ## Plain mode
 
 `--mode plain` runs a request the way headless mode does, but prints the whole
@@ -445,7 +483,7 @@ uv run harness-lab --mode plain "add a docstring to calc.py"
 
 ```text
 harness-lab · plain mode
-model Qwen3.5-4B-Q4_K_M.gguf · endpoint 127.0.0.1:8080 · workspace /tmp/demo · approval ask
+model Qwen3.5-4B-Q4_K_M.gguf · endpoint 127.0.0.1:8080 · context 32768 tokens · workspace /tmp/demo · approval ask
 
 you> Create greet.py with a function greet(name) returning a greeting string.
 
@@ -456,6 +494,8 @@ def greet(name):
     """Return a greeting string for the given name."""
     return f"Hello, {name}!"
 
+  ctx 3.1k/32k (9%) · 96 out
+
   → write_file path=greet.py
 approve write_file path=greet.py · content: 3 lines, 101 B? [y/N] y
   ← write_file
@@ -463,6 +503,7 @@ wrote greet.py (3 lines, 101 chars)
 syntax OK
 
 model> Done. Created `greet.py` with a `greet(name)` function.
+  ctx 3.4k/32k (10%) · 21 out
 ```
 
 - Given a prompt (or piped stdin) it runs once and exits, like headless mode.
@@ -565,6 +606,8 @@ and exchanges, in order:
   malformed and were repaired, and what was wrong with them
 - `context_budget` — the measured prompt overhead and the resulting history
   budget for the chosen `--tools` profile
+- `context_usage` — how full the window was for each prompt sent and each
+  turn that came back (see [Context usage](#context-usage))
 - `history_window` — turns dropped to fit the context, and what they were
 - `model_output` / `retry` / `malformed_tool_call` — raw model output and
   how it was parsed, plus any corrective notice sent back to the model
@@ -608,7 +651,10 @@ output quality, here's where each piece lives:
   real `n_ctx` in `agent.py: MiniAgent.__init__` (see `context_chars` in
   `utils.py`), spent by dropping whole turns in `_fit_history_budget`, and
   bounded by the stale-read rules in `_stale_read_indices`; file/note
-  retention lives in `agent.py: note_tool`
+  retention lives in `agent.py: note_tool`. How much of the window a run is
+  actually spending is on the screen while it runs and in the `context_usage`
+  log lines afterwards (see [Context usage](#context-usage)), which is what
+  makes a change to any of this measurable rather than a matter of taste
 - **Noisy-output budget** — `--max-tool-output` (0 disables it); applies to
   shell and search output only, never to file reads
 - **Generation and step budget** — `--max-steps`, `--max-new-tokens`,

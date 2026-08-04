@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
 
+from app_types import ContextUsage
+
 
 DOC_NAMES = ("AGENTS.md", "README.md", "pyproject.toml", "package.json")
 HELP_TEXT = "/help, /memory, /session, /log, /reset, /clear, /exit"
@@ -74,6 +76,37 @@ def context_chars(n_ctx: int, reserve_tokens: int, floor: int) -> int:
     if n_ctx <= 0:
         return floor
     return max(floor, int((n_ctx - reserve_tokens) * CHARS_PER_TOKEN))
+
+
+def compact_tokens(count: int) -> str:
+    """A token count short enough to sit on a status line: 812, 6.2k, 131k.
+
+    Thousands are floored rather than rounded, so a 32768-token window reads
+    as the "32k" its owner asked for instead of a puzzling 33k.
+    """
+    if count < 1000:
+        return str(count)
+    if count < 10000:
+        return f"{count / 1000:.1f}k"
+    return f"{count // 1000}k"
+
+
+def format_context(usage: ContextUsage) -> str:
+    """One line of "how full is the window", shared by the front-ends.
+
+    A `~` marks counts estimated from characters because the backend reported
+    no usage, so a guess is never read as a measurement -- but nothing sent
+    yet is exactly nothing, not an estimate of it. Without a known context
+    size there is no percentage to give, only what was sent.
+    """
+    mark = "~" if usage.estimated and usage.prompt_tokens else ""
+    used = f"{mark}{compact_tokens(usage.prompt_tokens)}"
+    if usage.limit <= 0:
+        return f"ctx {used} tokens"
+    # The share is parenthesised rather than another `·` field: on the status
+    # line it belongs to the count beside it, not next to `branch` and
+    # `approval`.
+    return f"ctx {used}/{compact_tokens(usage.limit)} ({usage.percent:.0f}%)"
 
 
 def middle(text: str, limit: int) -> str:

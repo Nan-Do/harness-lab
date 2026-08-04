@@ -54,7 +54,9 @@ uv run harness-lab \
 ```
 
 This starts the interactive TUI. The status bar at the bottom shows the
-active model, context size, current branch, approval policy, and session id.
+active model, how much of the context window the conversation is using out of
+how big it is (`ctx 6.2k/32k (19%)`, updated on every step), the current
+branch, the approval policy, and the session id.
 
 &nbsp;
 
