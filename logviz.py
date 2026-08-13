@@ -105,6 +105,8 @@ EVENT_STYLE = {
     "repl_command": ("COMMAND", (C.CYAN,)),
     "repl_error": ("REPL ERR", (C.RED,)),
     "retry": ("RETRY", (C.YELLOW,)),
+    "step_limit": ("STEPS", (C.YELLOW, C.BOLD)),
+    "step_limit_error": ("STEPS ERR", (C.RED,)),
     "reset": ("RESET", (C.MAGENTA,)),
     "final": ("FINAL", (C.GREEN, C.BOLD)),
 }
@@ -568,6 +570,22 @@ def render_retry(d, w, full):
     return hdr, text_lines(d.get("notice"), w, full)
 
 
+def render_step_limit(d, w, full):
+    """Where a run ran out of steps, and what was decided about it."""
+    granted = d.get("granted")
+    if granted is None:
+        outcome = "stopped"
+    elif granted == "unlimited":
+        outcome = "granted=no limit"
+    else:
+        outcome = f"granted=+{granted}"
+    hdr = (
+        f"tool_steps={d.get('tool_steps')} limit={d.get('limit')} "
+        f"policy={d.get('policy')} asked={d.get('asked')} {outcome}"
+    )
+    return hdr, []
+
+
 def render_final(d, w, full):
     hdr = f"reason={d.get('reason')} attempts={d.get('attempts')} tool_steps={d.get('tool_steps')}"
     return hdr, text_lines(d.get("final"), w, full)
@@ -590,6 +608,7 @@ RENDERERS = {
     "tool_error": render_tool_error,
     "malformed_tool_call": render_malformed_tool_call,
     "retry": render_retry,
+    "step_limit": render_step_limit,
     "final": render_final,
 }
 

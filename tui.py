@@ -18,7 +18,7 @@ from textual.containers import Horizontal
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Header, Input, RichLog, Static
 
-from agent import MiniAgent
+from agent import NO_STEP_LIMIT, MiniAgent
 from app_types import ContextUsage
 from tool_support import size_note, split_args, streaming_body
 from utils import HELP_DETAILS, APP_NAME, format_context
@@ -104,6 +104,65 @@ class ApprovalScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class StepLimitScreen(ModalScreen[int | None]):
+    """Blocking dialog for a request that has spent its step budget.
+
+    A small model that is circling and one that is halfway through real work
+    both look like "out of steps" from the outside, and only the person
+    watching the transcript can tell them apart -- so the choice is theirs:
+    another budget's worth, no limit at all, or stop here.
+    """
+
+    BINDINGS = [
+        Binding("c,y,enter", "grant", "Continue"),
+        Binding("u", "unlimited", "No limit"),
+        Binding("s,n,escape", "stop", "Stop"),
+    ]
+
+    def __init__(self, tool_steps: int, limit: int) -> None:
+        super().__init__()
+        self._tool_steps = tool_steps
+        self._limit = limit
+
+    def compose(self) -> ComposeResult:
+        body = Text("Step limit reached\n\n", style="bold")
+        body.append(f"The request has spent {self._tool_steps} tool steps ")
+        body.append("without reaching an answer.\n\n")
+        body.append("Continue for another ", style="dim")
+        body.append(str(self._limit), style="bold")
+        body.append(" steps, drop the limit for the rest of this ", style="dim")
+        body.append("request, or stop here.\n", style="dim")
+        body.append("\nAn unlimited run is stopped with ", style="dim")
+        body.append("ctrl+g", style="bold")
+        body.append(".", style="dim")
+        yield Static(body, id="approval-body")
+        with Horizontal(id="approval-buttons"):
+            yield Button(f"Continue +{self._limit} (c)", variant="success", id="grant")
+            yield Button("No limit (u)", variant="warning", id="unlimited")
+            yield Button("Stop (s)", variant="error", id="stop")
+
+    def action_grant(self) -> None:
+        self.dismiss(self._limit)
+
+    def action_unlimited(self) -> None:
+        self.dismiss(NO_STEP_LIMIT)
+
+    def action_stop(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#grant")
+    def _on_grant(self) -> None:
+        self.action_grant()
+
+    @on(Button.Pressed, "#unlimited")
+    def _on_unlimited(self) -> None:
+        self.action_unlimited()
+
+    @on(Button.Pressed, "#stop")
+    def _on_stop(self) -> None:
+        self.action_stop()
+
+
 class MiniAgentApp(App):
     """A modern conversational front-end around :class:`MiniAgent`."""
 
@@ -136,10 +195,10 @@ class MiniAgentApp(App):
         border: round $accent;
         margin: 0;
     }
-    ApprovalScreen {
+    ApprovalScreen, StepLimitScreen {
         align: center middle;
     }
-    ApprovalScreen > #approval-body {
+    ApprovalScreen > #approval-body, StepLimitScreen > #approval-body {
         width: 70;
         padding: 1 2;
         border: round $warning;
@@ -160,6 +219,12 @@ class MiniAgentApp(App):
         Binding("ctrl+c", "quit", "Quit"),
         Binding("ctrl+l", "clear_log", "Clear"),
         Binding("ctrl+r", "reset_session", "Reset"),
+        # Not ctrl+x or ctrl+c: the prompt Input binds both (cut and copy) and
+        # a focused widget's bindings win, so the key would never arrive.
+        # ctrl+g is free, and escape rides along for the instinct to reach for
+        # it -- on a modal, that screen's own escape binding takes precedence.
+        Binding("ctrl+g", "interrupt", "Interrupt"),
+        Binding("escape", "interrupt", "Interrupt", show=False),
     ]
 
     def __init__(
@@ -206,6 +271,8 @@ class MiniAgentApp(App):
         # Route the `ask` approval policy through a modal dialog.
         if self.agent.approval_policy == "ask":
             self.agent.tools.approval_fn = self._approval_callback
+        if self.agent.on_step_limit == "ask":
+            self.agent.step_limit_fn = self._step_limit_callback
         self.set_interval(0.1, self._tick_spinner)
         self._write_banner()
         self.query_one("#prompt", Input).focus()
@@ -263,12 +330,21 @@ class MiniAgentApp(App):
                     (f"context    {self.context or 'unknown'} tokens\n", ""),
                     (f"endpoint   {self.endpoint}\n", ""),
                     (f"approval   {self.agent.approval_policy}\n", ""),
+                    (f"steps      {self._step_budget()}\n", ""),
                     ("\nType a request and press Enter. /help lists commands.", "dim"),
                 ),
                 border_style="cyan",
                 title="Welcome",
             )
         )
+
+    def _step_budget(self) -> str:
+        """The step budget as the banner puts it, including what happens next."""
+        if self.agent.max_steps == NO_STEP_LIMIT:
+            return "no limit (ctrl+g stops a run)"
+        if self.agent.on_step_limit == "ask":
+            return f"{self.agent.max_steps} per request, then ask"
+        return f"{self.agent.max_steps} per request"
 
     def _write_user(self, text: str) -> None:
         self._logview.write(Panel(Text(text), title="You", border_style="cyan"))
@@ -525,6 +601,16 @@ class MiniAgentApp(App):
             self.call_from_thread(
                 self._write_notice, "retrying: " + data.get("notice", ""), "yellow"
             )
+        elif event_type == "step_limit":
+            # Ahead of the dialog the callback is about to raise, so the log
+            # says what the question is about before it covers the screen.
+            self.call_from_thread(self._end_stream, True)
+            self.call_from_thread(
+                self._write_notice,
+                f"step limit reached after {data.get('step', 0)} of "
+                f"{data.get('limit', 0)} tool steps",
+                "yellow",
+            )
         elif event_type == "final":
             self.call_from_thread(self._end_stream, False)
             self.call_from_thread(self._write_agent, data.get("text", ""))
@@ -573,12 +659,50 @@ class MiniAgentApp(App):
         done.wait()
         return result["approved"]
 
+    def _step_limit_callback(self, tool_steps: int, limit: int) -> int | None:
+        """Blocking step-limit prompt invoked from the agent worker thread."""
+        done = threading.Event()
+        result: dict[str, int | None] = {"granted": None}
+
+        def request() -> None:
+            def on_result(granted: int | None) -> None:
+                result["granted"] = granted
+                done.set()
+
+            self.push_screen(StepLimitScreen(tool_steps, limit), on_result)
+
+        self.call_from_thread(request)
+        done.wait()
+        granted = result["granted"]
+        if granted is None:
+            self.call_from_thread(self._write_notice, "stopping at the step limit")
+        elif granted == NO_STEP_LIMIT:
+            self.call_from_thread(
+                self._write_notice, "continuing with no step limit (ctrl+g stops it)"
+            )
+        else:
+            self.call_from_thread(
+                self._write_notice, f"continuing for {granted} more steps"
+            )
+        return granted
+
     # --- Actions -----------------------------------------------------------
 
     def action_clear_log(self) -> None:
         self._reset_stream()
         self._logview.clear()
         self._write_banner()
+
+    def action_interrupt(self) -> None:
+        """Stop a running request after the step in flight.
+
+        The way out of a run with no step budget, and of one that was granted
+        more steps than it turned out to need.
+        """
+        if not self._busy:
+            return
+        self.agent.stop()
+        self._write_notice("interrupting after the current step…")
 
     def action_reset_session(self) -> None:
         self.agent.reset()

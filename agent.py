@@ -29,6 +29,18 @@ from utils import (
 # Tools whose `path` argument names a file worth remembering as in-play.
 FILE_TOOLS = frozenset(READ_TOOLS + WRITE_TOOLS + ("outline_file", "move_file"))
 
+# A step budget of 0 means there is none: the request runs until the model
+# answers or the user stops it. Used both for the budget a request starts with
+# (`--max-steps 0`) and for what a step-limit callback returns to drop the
+# limit mid-run, so "no limit" spells the same everywhere.
+NO_STEP_LIMIT = 0
+# Without a step budget nothing bounds a model that keeps returning malformed
+# calls or nothing at all -- the loop would spin on the backend forever -- so an
+# unlimited run still gives up after this many consecutive turns that produced
+# neither a tool call nor an answer. Bounded runs are covered by their own
+# attempt budget (see _attempt_budget).
+MAX_STUCK_ATTEMPTS = 8
+
 
 class MiniAgent:
     def __init__(
@@ -39,6 +51,8 @@ class MiniAgent:
         session: Session | None = None,
         approval_policy: str = "ask",
         max_steps: int = 6,
+        on_step_limit: str = "stop",
+        step_limit_fn: Callable[[int, int], int | None] | None = None,
         max_new_tokens: int = 512,
         depth: int = 0,
         max_depth: int = 1,
@@ -56,7 +70,17 @@ class MiniAgent:
         self.session_store = session_store
         self.approval_policy = approval_policy
         self.approval_fn = approval_fn
-        self.max_steps = max_steps
+        self.max_steps = max(max_steps, NO_STEP_LIMIT)
+        # What to do when a request spends its step budget: "stop" ends it with
+        # a notice (the old behaviour), "ask" puts the question to whoever is
+        # driving. A front-end that can ask installs `step_limit_fn`; without
+        # one -- headless, a piped run, a delegated child -- there is nobody to
+        # answer, so "ask" degrades to stopping rather than looping unattended.
+        self.on_step_limit = on_step_limit
+        self.step_limit_fn = step_limit_fn
+        # Set from another thread (the TUI's interrupt key) to end a running
+        # request at the next step; the escape hatch for an unlimited run.
+        self._interrupted = False
         self.max_new_tokens = max_new_tokens
         self.depth = depth
         self.max_depth = max_depth
@@ -616,6 +640,70 @@ class MiniAgent:
 
         return on_text, on_tool, on_reasoning
 
+    def stop(self: Self) -> None:
+        """Ask a running request to finish after the step in flight.
+
+        Called from another thread than the one in `ask` (the TUI runs the
+        agent in a worker), so it does nothing but set a flag the loop reads:
+        the tool call already underway is allowed to finish and be recorded,
+        which keeps the session consistent. This is the way out of a run with
+        no step budget.
+        """
+        self._interrupted = True
+
+    @staticmethod
+    def _attempt_budget(limit: int) -> int:
+        """How many model turns a budget of `limit` tool steps may cost.
+
+        Steps are only spent on calls that actually ran; malformed calls and
+        empty replies cost a turn and no step, so a budget-shaped allowance on
+        top of it is what keeps a model that never manages a valid call from
+        looping. Unused when there is no step budget at all.
+        """
+        return max(limit * 3, limit + 4)
+
+    def _grant_more_steps(
+        self: Self,
+        on_event: Callable[..., None] | None,
+        tool_steps: int,
+        limit: int,
+    ) -> int | None:
+        """Decide whether a request that spent its step budget may continue.
+
+        Small models circle, and the step limit is what stops a run that is not
+        getting anywhere -- so it is never raised on its own. Under
+        `--on-step-limit ask` the front-end puts the question to the user; with
+        no front-end able to ask (headless, a piped run, a delegated child)
+        there is nobody to answer and the run stops, as it always did.
+
+        Returns the extra steps granted, `NO_STEP_LIMIT` to run the rest of the
+        request unbounded, or None to stop here.
+        """
+        self._emit(on_event, "step_limit", step=tool_steps, limit=limit)
+        asked = self.on_step_limit == "ask" and self.step_limit_fn is not None
+        granted: int | None = None
+        if asked:
+            try:
+                granted = self.step_limit_fn(tool_steps, limit)
+            except Exception:
+                # A front-end that fails to ask must not turn into a run that
+                # continues unasked; stopping is the safe reading.
+                self.logger.log("step_limit_error", limit=limit, tool_steps=tool_steps)
+                granted = None
+            if granted is not None and granted < NO_STEP_LIMIT:
+                # A grant that would shrink the budget is nonsense; read it the
+                # same way as no answer at all.
+                granted = None
+        self.logger.log(
+            "step_limit",
+            limit=limit,
+            tool_steps=tool_steps,
+            policy=self.on_step_limit,
+            asked=asked,
+            granted="unlimited" if granted == NO_STEP_LIMIT else granted,
+        )
+        return granted
+
     def ask(
         self: Self,
         user_message: str,
@@ -627,17 +715,44 @@ class MiniAgent:
         self.logger.log(
             "request_start",
             max_steps=self.max_steps,
+            on_step_limit=self.on_step_limit,
             max_new_tokens=self.max_new_tokens,
             user_message=user_message,
         )
         self.log_memory("request_start")
         self.record(MessageEntry(role="user", content=user_message, created_at=now()))
+        self._interrupted = False
 
         tool_steps = 0
         attempts = 0
-        max_attempts = max(self.max_steps * 3, self.max_steps + 4)
+        # This request's own budget: it starts at the configured one and can be
+        # raised (or dropped entirely) mid-run, so the limit that stopped a run
+        # is the one reported at the end rather than what it began with.
+        limit = self.max_steps
+        max_attempts = self._attempt_budget(limit)
+        # Consecutive turns that produced nothing usable; the only guard an
+        # unlimited run has (see MAX_STUCK_ATTEMPTS).
+        stuck = 0
+        stop_reason = ""
 
-        while tool_steps < self.max_steps and attempts < max_attempts:
+        while True:
+            if self._interrupted:
+                stop_reason = "interrupted"
+                break
+            if limit != NO_STEP_LIMIT and tool_steps >= limit:
+                granted = self._grant_more_steps(on_event, tool_steps, limit)
+                if granted is None:
+                    stop_reason = "max_steps"
+                    break
+                limit = NO_STEP_LIMIT if granted == NO_STEP_LIMIT else limit + granted
+                max_attempts = self._attempt_budget(limit)
+            if limit == NO_STEP_LIMIT:
+                if stuck >= MAX_STUCK_ATTEMPTS:
+                    stop_reason = "max_attempts"
+                    break
+            elif attempts >= max_attempts:
+                stop_reason = "max_attempts"
+                break
             attempts += 1
             self._emit(on_event, "thinking", attempt=attempts, step=tool_steps)
             messages = self.build_messages(user_message)
@@ -708,6 +823,7 @@ class MiniAgent:
                 self.log_memory("malformed_tool_call")
 
             if response.tool_calls:
+                stuck = 0
                 # Keep the model's plan text attached to its first tool call
                 # so the transcript preserves its thread of thought.
                 assistant_text = response.content.strip()
@@ -746,7 +862,9 @@ class MiniAgent:
                     )
                     assistant_text = ""
                     self.note_tool(name, args, result)
-                    if tool_steps >= self.max_steps:
+                    if self._interrupted:
+                        break
+                    if limit != NO_STEP_LIMIT and tool_steps >= limit:
                         break
                 if response.malformed_tool_calls:
                     self.record_retry(
@@ -763,10 +881,12 @@ class MiniAgent:
                     self.record(
                         MessageEntry(role="assistant", content=final, created_at=now())
                     )
+                stuck += 1
                 self.record_retry(on_event, attempts, self.malformed_notice(response))
                 continue
 
             if not final:
+                stuck += 1
                 self.record_retry(
                     on_event,
                     attempts,
@@ -787,21 +907,25 @@ class MiniAgent:
             self._emit(on_event, "final", text=final)
             return final
 
-        if attempts >= max_attempts and tool_steps < self.max_steps:
+        if stop_reason == "interrupted":
+            final = "Stopped at your request, before the model reached an answer."
+        elif stop_reason == "max_attempts":
             final = "Stopped after too many malformed model responses without a valid tool call or final answer."
-            reason = "max_attempts"
         else:
-            final = "Stopped after reaching the step limit without a final answer."
-            reason = "max_steps"
+            final = (
+                f"Stopped after reaching the step limit ({limit} tool steps) "
+                "without a final answer. Raise --max-steps (0 removes the limit), "
+                "or run with --on-step-limit ask to be asked whether to continue."
+            )
         self.record(MessageEntry(role="assistant", content=final, created_at=now()))
         self.logger.log(
             "final",
-            reason=reason,
+            reason=stop_reason,
             tool_steps=tool_steps,
             attempts=attempts,
             final=final,
         )
-        self._emit(on_event, "final", text=final, reason=reason)
+        self._emit(on_event, "final", text=final, reason=stop_reason)
         return final
 
     def record_retry(

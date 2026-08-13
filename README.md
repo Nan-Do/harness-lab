@@ -76,6 +76,12 @@ diff the two runs to see what the change actually did.
 - **Approval** (`tools.py: ToolRegistry._approve`) — tools marked `risky`
   (shell, file writes) are gated by `--approval ask|auto|never`; the TUI
   routes `ask` through a modal dialog instead of a terminal prompt.
+- **Step budget** (`agent.py: ask`, `_grant_more_steps`) — a request may spend
+  `--max-steps` tool calls, which is what stops a small model going in
+  circles. When the budget runs out the run does not simply die: with
+  `--on-step-limit ask` (default) the front-end asks whether to continue —
+  for another budget's worth or with no limit at all — and `--max-steps 0`
+  starts a run unbounded. See [Step limit](#step-limit).
 - **Memory** (`app_types.Memory`, `agent.py: note_tool`/`remember`) — a
   small distilled summary (current task, up to 8 recently touched files, up
   to 5 recent notes) kept separately from the full transcript, so the model
@@ -246,6 +252,65 @@ readable dialog.
 
 &nbsp;
 
+## Step limit
+
+A request is allowed `--max-steps` tool calls (default `6`). The limit exists
+because small models circle: they re-read the same file, re-run the same
+command, and announce the same plan without ever finishing it. Cutting the run
+off is how the harness keeps that from going on forever.
+
+The trouble is that a run which is genuinely getting somewhere looks exactly
+the same from the outside — out of steps, no answer — and only the person
+watching the transcript can tell the two apart. So the limit is not a silent
+verdict. When a request spends its budget, `--on-step-limit` decides:
+
+- `--on-step-limit ask`
+  the question goes to whoever is driving (default)
+- `--on-step-limit stop`
+  the request ends with a notice, as it always did
+
+There are three answers:
+
+- **continue** — grants another `--max-steps` worth and asks again when those
+  are spent, so a long task can be nursed along a budget at a time
+- **no limit** — drops the limit for the rest of this request; nothing more is
+  asked and the run ends when the model answers (or you stop it)
+- **stop** — ends the request where it stands
+
+In the TUI the question is a modal dialog (`c` / `u` / `s`); in plain mode it
+is a prompt on stdin:
+
+```text
+  ! step limit reached after 6 of 6 tool steps
+  continue?  [c] +6 steps · [u] no limit · [s] stop >
+```
+
+To start a run with no limit at all, pass `--max-steps 0`:
+
+```bash
+uv run harness-lab --max-steps 0 --mode plain "port the tests to pytest"
+```
+
+An unlimited run needs a way out, and it has two. **ctrl+g** in the TUI (or
+**Ctrl-C** in plain and headless mode) ends the request after the step in
+flight, so the tool call already running still finishes and is recorded. And a
+model that stops producing anything usable — malformed calls, empty replies —
+is given up on after 8 consecutive turns, since an unbounded loop against a
+stuck model would otherwise hammer `llama-server` indefinitely. A bounded run
+has its own allowance for those turns, derived from the step budget.
+
+Nothing continues unasked. `--on-step-limit ask` needs a front-end that can
+put the question to someone, and headless mode, piped input, and delegated
+child agents have nobody to answer — so there the policy falls back to
+stopping, and an unattended run behaves exactly as it did before. The
+decision is logged either way:
+
+```text
+STEPS      tool_steps=6 limit=6 policy=ask asked=True granted=no limit
+```
+
+&nbsp;
+
 ## Resume sessions
 
 The agent saves sessions under the target workspace root in:
@@ -318,7 +383,10 @@ python main.py --help
 - `--resume` — resume a saved session by id, or `latest`; default: start a
   new session
 - `--approval` — `ask`, `auto`, or `never`; default `ask`
-- `--max-steps` — maximum tool/model iterations per request; default `6`
+- `--max-steps` — maximum tool steps per request; `0` runs without a limit;
+  default `6`. See [Step limit](#step-limit)
+- `--on-step-limit` — what happens when a request spends its step budget:
+  `ask` offers to continue, `stop` ends it with a notice; default `ask`
 - `--max-new-tokens` — maximum model output tokens per step; default `512`
 - `--temperature` — sampling temperature sent to `llama-server`; default `0.2`
 - `--top-p` — nucleus sampling value sent to `llama-server`; default `0.9`
@@ -657,8 +725,10 @@ output quality, here's where each piece lives:
   makes a change to any of this measurable rather than a matter of taste
 - **Noisy-output budget** — `--max-tool-output` (0 disables it); applies to
   shell and search output only, never to file reads
-- **Generation and step budget** — `--max-steps`, `--max-new-tokens`,
-  `--temperature`, `--top-p`
+- **Generation and step budget** — `--max-steps`, `--on-step-limit`,
+  `--max-new-tokens`, `--temperature`, `--top-p`; how often a run hits the
+  limit, and whether the extra steps granted after it actually finish the
+  task, is itself a measure of whether a model can hold a task together
 - **Transport** — `--stream` / `--no-stream`; changes when output is visible,
   and is worth flipping when a backend's streamed tool calls look suspect
 - **Visible thinking** — `--reasoning` / `--no-reasoning`; changes only what

@@ -175,6 +175,10 @@ def stub_agent(ask) -> SimpleNamespace:
     return SimpleNamespace(
         ask=ask,
         approval_policy="never",
+        max_steps=6,
+        on_step_limit="stop",
+        step_limit_fn=None,
+        stop=lambda: None,
         tools=SimpleNamespace(approval_fn=None),
         workspace=SimpleNamespace(branch="main", cwd="/tmp/x"),
         session=SimpleNamespace(id="test-session"),

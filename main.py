@@ -37,7 +37,8 @@ def build_agent(args: argparse.Namespace) -> MiniAgent:
     )
     options = {
         "approval_policy": args.approval,
-        "max_steps": args.max_steps,
+        "max_steps": max(args.max_steps, 0),
+        "on_step_limit": args.on_step_limit,
         "max_new_tokens": args.max_new_tokens,
         "logger": logger,
         "tool_profile": args.tools,
@@ -133,7 +134,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--max-steps",
         type=int,
         default=6,
-        help="Maximum tool/model iterations per request.",
+        help=(
+            "Maximum tool/model iterations per request; 0 runs without a limit "
+            "until the model answers (Ctrl-C, or ctrl+g in the TUI, stops it)."
+        ),
+    )
+    parser.add_argument(
+        "--on-step-limit",
+        choices=("ask", "stop"),
+        default="ask",
+        help=(
+            "What to do when a request spends its step budget. 'ask' offers to "
+            "continue -- for more steps or with no limit at all -- in the TUI "
+            "and plain mode; 'stop' ends the request with a notice. Anything "
+            "with nobody to ask (headless, piped input) always stops."
+        ),
     )
     parser.add_argument(
         "--tools",
@@ -233,6 +248,11 @@ def run_headless(agent: MiniAgent, prompt: str) -> int:
         agent.logger.log("repl_error", mode="headless", error=str(exc))
         print(str(exc), file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        # The way out of `--max-steps 0`, which has no other end.
+        agent.logger.log("repl_error", mode="headless", error="interrupted")
+        print("interrupted", file=sys.stderr)
+        return 130
     return 0
 
 

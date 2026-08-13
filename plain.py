@@ -19,7 +19,7 @@ from typing import Any, Dict
 from rich.console import Console
 from rich.text import Text
 
-from agent import MiniAgent
+from agent import NO_STEP_LIMIT, MiniAgent
 from app_types import ContextUsage
 from tool_support import size_note, split_args, streaming_body
 from utils import HELP_DETAILS, compact_tokens, format_context
@@ -125,6 +125,12 @@ class PlainView:
             )
         elif event_type == "retry":
             self._line(f"\n  ! retrying: {data.get('notice', '')}", "yellow")
+        elif event_type == "step_limit":
+            self._line(
+                f"\n  ! step limit reached after {data.get('step', 0)} of "
+                f"{data.get('limit', 0)} tool steps",
+                "yellow",
+            )
         elif event_type == "final":
             self._on_final(data.get("text", ""))
 
@@ -232,6 +238,36 @@ class PlainView:
 
     # --- Driving the agent -------------------------------------------------
 
+    def step_limit(self, tool_steps: int, limit: int) -> int | None:
+        """Ask on stdin whether a run that spent its step budget continues.
+
+        Only a person at a terminal can answer this, so `run_plain` installs it
+        on a tty and nowhere else: a piped run that reached this question would
+        block on a read nobody is going to answer. Returns the steps granted,
+        `NO_STEP_LIMIT` to drop the limit for the rest of the request, or None
+        to stop -- which is also what Ctrl-C and end-of-input mean here.
+        """
+        while True:
+            # The event that got here already said where the run stands, so
+            # this line is only the question.
+            self._write(
+                f"  continue?  [c] +{limit} steps · [u] no limit · [s] stop > ",
+                "bold yellow",
+            )
+            self._channel = ""
+            try:
+                answer = input().strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                self.console.print()
+                return None
+            if answer in {"", "c", "y", "continue"}:
+                return limit
+            if answer in {"u", "unlimited", "forever"}:
+                self._line("running without a step limit; Ctrl-C stops it", "dim")
+                return NO_STEP_LIMIT
+            if answer in {"s", "n", "stop"}:
+                return None
+
     def ask(self, prompt: str, echo: bool = True) -> None:
         if echo:
             self._write("\nyou> ", "bold cyan")
@@ -242,6 +278,10 @@ class PlainView:
         except RuntimeError as exc:  # network/runtime failures from llama-server
             self.agent.logger.log("repl_error", mode="plain", error=str(exc))
             self._line(f"\nerror: {exc}", "red")
+        except KeyboardInterrupt:
+            # The way out of a run with no step budget.
+            self.agent.logger.log("repl_error", mode="plain", error="interrupted")
+            self._line("\ninterrupted", "yellow")
 
     def command(self, command: str) -> bool:
         """Handle a slash command; False means the session should end."""
@@ -269,6 +309,10 @@ def run_plain(
 ) -> int:
     """One-shot with a prompt, or a read-ask loop on an interactive terminal."""
     view = PlainView(agent, show_reasoning=show_reasoning)
+    # A one-shot `--mode plain "prompt"` still asks, as long as there is a
+    # terminal to ask at; only a piped run has nobody to answer.
+    if agent.on_step_limit == "ask" and sys.stdin.isatty():
+        agent.step_limit_fn = view.step_limit
     view.banner(endpoint)
 
     if prompt:
