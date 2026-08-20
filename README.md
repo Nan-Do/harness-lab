@@ -24,6 +24,7 @@ diff the two runs to see what the change actually did.
 | `model_clients.py` | OpenAI-compatible client for `llama-server`: streamed and whole completions, tool-call parsing, reasoning extraction |
 | `app_types.py` | Dataclasses shared across the codebase (history entries, tool calls, session) |
 | `workspace.py` | One-shot collection of repo facts (branch, status, recent commits, project docs) |
+| `languages.py` | Language packs: the label and prompt rules `--language` adds, and the key its tools are gated on |
 | `session.py` | Loads/saves session transcripts as JSON under `.harness-lab/sessions/` |
 | `agent_logging.py` | Structured JSONL logger used everywhere in the loop |
 | `log_viewer.py` | Standalone CLI to pretty-print and filter a run's JSONL log |
@@ -39,7 +40,9 @@ diff the two runs to see what the change actually did.
   starts: repo root, current branch, `git status --short`, the last 5
   commits, and the contents of any `AGENTS.md` / `README.md` /
   `pyproject.toml` / `package.json` found in the repo root or working
-  directory. This becomes part of the system prompt.
+  directory. This becomes part of the system prompt, and carries the
+  `- language:` line when a run named one (see
+  [Language packs](#language-packs)).
 - **Prompt and message shape** (`agent.py: build_prefix`, `build_messages`)
   — the model is sent a native OpenAI-style chat message list: one `system`
   message (rules + workspace context, stable across a session), then
@@ -69,6 +72,12 @@ diff the two runs to see what the change actually did.
   line-number prefixes and code fences are stripped. Every repair is reported
   back to the model so it learns the right shape, and logged as
   `tool_args_normalized`.
+- **Language packs** (`languages.py`) — `--language python` tells the model
+  what it is writing and hands it the tools that can check that: `lint`
+  (ruff), `type_check` (mypy), and `write_tests`, which writes a pytest file
+  and runs it in the same step. Without the flag the harness stays
+  language-agnostic, exactly as before. See
+  [Language packs](#language-packs).
 - **Write safety** (`tools.py: ToolRegistry`) — every write is preceded by an
   automatic backup under `.harness-lab/backups/`, followed by a syntax check
   of the result (Python and JSON), and `write_file` refuses to replace an
@@ -387,6 +396,9 @@ python main.py --help
   default `6`. See [Step limit](#step-limit)
 - `--on-step-limit` — what happens when a request spends its step budget:
   `ask` offers to continue, `stop` ends it with a notice; default `ask`
+- `--language` — the language the workspace is worked in (`python`); adds the
+  language to the system prompt and unlocks its verification tools; default:
+  no language. See [Language packs](#language-packs)
 - `--max-new-tokens` — maximum model output tokens per step; default `512`
 - `--temperature` — sampling temperature sent to `llama-server`; default `0.2`
 - `--top-p` — nucleus sampling value sent to `llama-server`; default `0.9`
@@ -618,6 +630,9 @@ profile is an experiment knob rather than a fixed answer.
 | `delete_file` | standard | yes | Delete a file (backed up first) |
 | `revert_file` | full | yes | Restore a file from its most recent automatic backup |
 | `delegate` | full | no | Hand a bounded, read-only investigation to a child agent |
+| `lint` | `--language python` | no | Lint the code with ruff and report what it found |
+| `type_check` | `--language python` | no | Type-check the code with mypy and report what it found |
+| `write_tests` | `--language python` | yes | Write a pytest file for a module and run it in the same step |
 
 Notes:
 
@@ -645,6 +660,109 @@ Notes:
   spec per argument (see `tools.py: ToolRegistry._field_schema`); adding a
   new tool is a matter of writing a function and decorating it with
   `@agent_tool(...)`.
+- The last three are gated on `--language`, not on `--tools`: they appear in
+  every profile of a run that named their language and in none of a run that
+  did not (see [Language packs](#language-packs)).
+
+&nbsp;
+
+## Language packs
+
+Everything above is language-agnostic, which is the right default for a
+harness pointed at whatever repository you have — and the wrong one when you
+know what you are working on. `--language python` says so, and a run that says
+so gets three things.
+
+**The model is told.** The workspace block gains a line:
+
+```text
+Workspace:
+- language: Python
+- cwd: /tmp/demo
+```
+
+and the system prompt gains a short set of rules that name the tools below and
+say when to reach for them — that new code is checked and covered, and that
+code is not finished until the checks come back clean.
+
+**The verification tools appear.**
+
+| Tool | Runs | Risky |
+| --- | --- | --- |
+| `lint` | `ruff check --no-cache --output-format concise <path>` | no |
+| `type_check` | `mypy --ignore-missing-imports --check-untyped-defs <path>` | no |
+| `write_tests` | writes a pytest file, then runs it | yes |
+
+`lint` and `type_check` only read the code, so they are not gated by approval:
+a check the model has to ask permission for is a check it stops running. Each
+reports the checker's own output plus a one-line verdict, since `exit_code: 1`
+and a wall of findings is not a conclusion a small model reliably draws:
+
+```text
+  → lint path=calc.py
+  ← lint
+$ ruff check --no-cache --output-format concise calc.py
+exit_code: 1
+stdout:
+calc.py:2:12: F401 [*] `os` imported but unused
+stderr:
+(empty)
+ruff reported issues; fix them and run lint again
+```
+
+Both flags on the `mypy` line are there because the alternative is a checker
+that says nothing useful about freshly written code: missing third-party stubs
+are the loudest thing mypy has to say about a small project and none of it is
+about what the model wrote, and a model writing plain Python annotates
+nothing — which by default means mypy skips those function bodies entirely and
+reports success without having looked inside them.
+
+**Tests are generated and run in one step.** `write_tests` takes the module to
+cover and the test source the model wrote for it, writes it where the project
+keeps tests (`tests/test_<module>.py`, or beside the module if there is no
+`tests/`), and immediately runs pytest over it:
+
+```text
+  → write_tests path=calc.py
+approve write_tests path=calc.py · content: 5 lines, 65 B? [y/N] y
+  ← write_tests
+wrote tests/test_calc.py (5 lines, 65 chars)
+syntax OK
+$ /usr/bin/python -m pytest -q tests/test_calc.py
+exit_code: 0
+stdout:
+1 passed in 0.01s
+stderr:
+(empty)
+tests passed: calc.py does what these tests say
+```
+
+Writing and running are one tool rather than two because the interesting
+result is the second one, and a small model that has just written a test file
+will happily call it a day. The same reasoning shapes what it refuses: content
+with no `test_*` function, and a filename pytest would not collect, are both
+turned down before anything is written, because a suite that collects nothing
+passes — and a pass is what the model reads as proof. `pytest` exiting with
+"collected nothing" or "no module named pytest" is reported as *neither* a
+pass nor a failing test, for the same reason. Re-run the tests later with
+`run_tests`; `write_tests` is for writing them.
+
+The checkers are found in the order that respects the workspace: its own
+`.venv` first (invoked as `python -m <tool>`, which survives a moved
+virtualenv where the console script's absolute shebang does not), then a
+binary on `PATH`, then the environment the harness itself runs in — so
+`uv sync` here is enough to check a project that has no environment of its
+own. A checker that is nowhere to be found is reported as a checker that is
+missing, with what to do instead, rather than as code that failed a check.
+
+```bash
+uv run harness-lab --language python --mode plain "write factorial.py and prove it works"
+```
+
+Nothing about the flag is load-bearing for the rest of the harness: a run
+without it behaves exactly as it did before, and adding a language is adding
+an entry to `languages.py` plus its tools in `tools.py`, declared with
+`language="<key>"`.
 
 &nbsp;
 
@@ -655,7 +773,8 @@ log to `.harness-lab/logs/run-<timestamp>.jsonl` (under the workspace
 root, so it is already git-ignored). It records everything the agent stores
 and exchanges, in order:
 
-- `session_start` — session id, workspace, approval policy, whether it resumed
+- `session_start` — session id, workspace, approval policy, the `--language`
+  the run was started with, whether it resumed
 - `request_start` / `final` — the lifecycle of a single `ask()`
 - `memory_update` — a full snapshot of the distilled memory (task, files,
   notes) every time it changes
@@ -715,6 +834,11 @@ output quality, here's where each piece lives:
   the harness rather than the model
 - **Write friction** — `--no-write-guard` removes the read-before-overwrite
   requirement
+- **Knowing the language** — `--language python` adds the language to the
+  prompt and the checkers to the tool set; running the same task with and
+  without it is the cleanest measure of whether a small model uses
+  verification it is given, or only claims to
+  (see [Language packs](#language-packs))
 - **Context/memory budget** — the history budget is derived from the model's
   real `n_ctx` in `agent.py: MiniAgent.__init__` (see `context_chars` in
   `utils.py`), spent by dropping whole turns in `_fit_history_budget`, and

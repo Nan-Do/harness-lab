@@ -1,6 +1,7 @@
 import subprocess
 from pathlib import Path
 
+from languages import Language, resolve_language
 from utils import DOC_NAMES
 
 
@@ -14,6 +15,7 @@ class WorkspaceContext:
         status,
         recent_commits,
         project_docs,
+        language=None,
     ):
         self.cwd = cwd
         self.repo_root = repo_root
@@ -22,9 +24,13 @@ class WorkspaceContext:
         self.status = status
         self.recent_commits = recent_commits
         self.project_docs = project_docs
+        # The language the run was told it is working in (--language), or None
+        # when nothing was named. Kept as the resolved pack rather than the raw
+        # key so everything that displays it agrees on the label.
+        self.language: Language | None = resolve_language(language)
 
     @classmethod
-    def build(cls, cwd):
+    def build(cls, cwd, language=None):
         cwd = Path(cwd).resolve()
 
         def git(args, fallback=""):
@@ -69,6 +75,7 @@ class WorkspaceContext:
                 line for line in git(["log", "--oneline", "-5"]).splitlines() if line
             ],
             project_docs=docs,
+            language=language,
         )
 
     def text(self):
@@ -79,9 +86,11 @@ class WorkspaceContext:
             )
             or "- none"
         )
+        language = [f"- language: {self.language.label}"] if self.language else []
         return "\n".join(
             [
                 "Workspace:",
+                *language,
                 f"- cwd: {self.cwd}",
                 f"- repo_root: {self.repo_root}",
                 f"- branch: {self.branch}",

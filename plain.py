@@ -70,10 +70,12 @@ class PlainView:
     def banner(self, endpoint: str) -> None:
         agent = self.agent
         self._line("harness-lab · plain mode", "bold cyan")
+        language = f" · language {agent.language.label}" if agent.language else ""
         self._line(
             f"model {agent.model_client.model} · endpoint {endpoint} · "
             f"context {agent.context_limit or 'unknown'} tokens · "
-            f"workspace {agent.workspace.cwd} · approval {agent.approval_policy}",
+            f"workspace {agent.workspace.cwd} · approval {agent.approval_policy}"
+            f"{language}",
             "dim",
         )
 

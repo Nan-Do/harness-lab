@@ -19,7 +19,11 @@ harness-lab = "main:main"
 [dependency-groups]
 dev = [
   "pytest>=8.3.5",
+  # The checkers behind --language python. Installed here so a synced
+  # environment can verify Python workspaces out of the box; the tools also
+  # accept them from the target workspace's own .venv or from PATH.
   "ruff>=0.4.4",
+  "mypy>=1.10.0",
 ]
 
 [tool.setuptools]
@@ -27,6 +31,7 @@ py-modules = [
     "agent",
     "agent_logging",
     "app_types",
+    "languages",
     "log_viewer",
     "main",
     "model_clients",

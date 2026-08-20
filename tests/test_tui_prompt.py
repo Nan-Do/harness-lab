@@ -31,6 +31,7 @@ def stub_agent(asked: list) -> SimpleNamespace:
         stop=lambda: None,
         tools=SimpleNamespace(approval_fn=None),
         workspace=SimpleNamespace(branch="main", cwd="/tmp/x"),
+        language=None,
         session=SimpleNamespace(id="test-session"),
         logger=SimpleNamespace(log=lambda *a, **k: None),
         memory_text=lambda: "Memory:",

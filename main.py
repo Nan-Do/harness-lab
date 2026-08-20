@@ -5,6 +5,7 @@ from pathlib import Path
 
 from agent import MiniAgent
 from agent_logging import AgentLogger
+from languages import LANGUAGE_CHOICES
 from model_clients import LlamaCppModelClient
 from plain import run_plain
 from session import SessionStore
@@ -22,7 +23,7 @@ def build_logger(args: argparse.Namespace, repo_root: str) -> AgentLogger:
 
 
 def build_agent(args: argparse.Namespace) -> MiniAgent:
-    workspace = WorkspaceContext.build(args.cwd)
+    workspace = WorkspaceContext.build(args.cwd, language=args.language)
     store = SessionStore(Path(workspace.repo_root) / ".harness-lab" / "sessions")
     logger = build_logger(args, workspace.repo_root)
     model = LlamaCppModelClient(
@@ -45,6 +46,7 @@ def build_agent(args: argparse.Namespace) -> MiniAgent:
         "max_noisy_output": max(args.max_tool_output, 0),
         "require_read_before_overwrite": not args.no_write_guard,
         "add_planning": args.planning,
+        "language": args.language,
     }
     session_id = args.resume
     if session_id == "latest":
@@ -159,6 +161,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "set, 'standard' adds navigation and verification tools, 'full' adds "
             "delegation and revert. More tools give more reach but cost accuracy "
             "on small models."
+        ),
+    )
+    parser.add_argument(
+        "--language",
+        choices=LANGUAGE_CHOICES,
+        default=None,
+        help=(
+            "Language the workspace is worked in. Naming it puts the language "
+            "in the system prompt and adds the tools that check that "
+            "language's code: for python, 'lint' (ruff), 'type_check' (mypy) "
+            "and 'write_tests' (write a pytest file and run it). Without it "
+            "the harness stays language-agnostic."
         ),
     )
     parser.add_argument(

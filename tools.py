@@ -1,3 +1,5 @@
+import importlib.util
+import shlex
 import shutil
 import subprocess
 import sys
@@ -7,6 +9,7 @@ from pathlib import Path
 from typing import Callable, Dict, List
 
 from agent_logging import AgentLogger
+from languages import resolve_language
 from workspace import WorkspaceContext
 from utils import (
     BACKUP_DIR_NAME,
@@ -70,6 +73,7 @@ def agent_tool(
     example: str = "",
     profile: str = "standard",
     volatile: bool = False,
+    language: str = "",
 ):
     """Decorator to register a tool function into the global catalog.
 
@@ -79,7 +83,10 @@ def agent_tool(
 
     `profile` is the smallest tool set this tool appears in (see
     utils.TOOL_PROFILES); `volatile` marks tools whose identical repeat is not a
-    loop.
+    loop. `language` restricts a tool to runs that named that language
+    (--language, see languages.py): the checker it drives only makes sense for
+    that language's code, and a tool the model cannot use is context spent for
+    nothing.
     """
 
     def decorator(func: Callable):
@@ -89,6 +96,7 @@ def agent_tool(
             "risky": risky,
             "func": func,
             "profile": profile,
+            "language": language,
         }
         if example:
             _TOOL_EXAMPLES[name] = example
@@ -443,7 +451,26 @@ _SHELL_ENV = {
 }
 
 
-def _shell_result(registry: "ToolRegistry", command: str, timeout: int) -> str:
+def _project_python(root: Path) -> str:
+    """The interpreter to run the workspace's own code with.
+
+    A project virtualenv is what the code under test was written against, so
+    it wins over the interpreter the harness happens to run on.
+    """
+    venv_python = root / ".venv" / "bin" / "python"
+    return str(venv_python) if venv_python.exists() else sys.executable
+
+
+def _run_command(
+    registry: "ToolRegistry", command: str, timeout: int
+) -> tuple[int, str]:
+    """Run a shell command in the workspace; returns its exit code and the
+    formatted transcript the model is shown.
+
+    The code is handed back separately because a checker's verdict ("clean" vs
+    "fix this") is exactly its exit code, and re-deriving that by reading the
+    formatted text back would be guesswork.
+    """
     import os
 
     try:
@@ -465,23 +492,39 @@ def _shell_result(registry: "ToolRegistry", command: str, timeout: int) -> str:
         # The partial output is usually where the reason for the hang is, so
         # keep it instead of reporting a bare timeout.
         exit_code = -1
-        stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        stdout = (
+            exc.stdout.decode(errors="replace")
+            if isinstance(exc.stdout, bytes)
+            else (exc.stdout or "")
+        )
+        stderr = (
+            exc.stderr.decode(errors="replace")
+            if isinstance(exc.stderr, bytes)
+            else (exc.stderr or "")
+        )
         note = (
             f"\nnote: timed out after {timeout}s and was killed. Raise timeout, "
             "or run something that finishes on its own (no servers, no watchers)."
         )
 
     hint = "re-run with a narrower command or pipe through 'tail'"
-    return "\n".join(
-        [
-            f"exit_code: {exit_code}",
-            "stdout:",
-            registry.clip(stdout.strip(), hint) or "(empty)",
-            "stderr:",
-            registry.clip(stderr.strip(), hint) or "(empty)",
-        ]
-    ) + note
+    body = (
+        "\n".join(
+            [
+                f"exit_code: {exit_code}",
+                "stdout:",
+                registry.clip(stdout.strip(), hint) or "(empty)",
+                "stderr:",
+                registry.clip(stderr.strip(), hint) or "(empty)",
+            ]
+        )
+        + note
+    )
+    return exit_code, body
+
+
+def _shell_result(registry: "ToolRegistry", command: str, timeout: int) -> str:
+    return _run_command(registry, command, timeout)[1]
 
 
 @agent_tool(
@@ -504,7 +547,9 @@ def run_shell_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
     lowered = command.lower()
     for needle, reason in _SHELL_DENYLIST:
         if needle in lowered:
-            raise DeniedError(f"refused command containing '{needle.strip()}': {reason}")
+            raise DeniedError(
+                f"refused command containing '{needle.strip()}': {reason}"
+            )
     if command.rstrip().endswith("&"):
         raise DeniedError(
             "refused a backgrounded command; it would outlive this step. "
@@ -537,8 +582,7 @@ def run_tests_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
         # Validate before running so a typo is a cheap error, not a red suite.
         registry._path(target)
 
-    venv_python = root / ".venv" / "bin" / "python"
-    python = str(venv_python) if venv_python.exists() else sys.executable
+    python = _project_python(root)
 
     if (
         (root / "pyproject.toml").exists()
@@ -1014,6 +1058,289 @@ def delegate_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
     return execute
 
 
+# --- Python verification (--language python) ---
+#
+# These three only exist when a run names its language (--language python).
+# They are declared `profile="minimal"` on purpose: the language flag is their
+# gate, so asking for a language never depends on also asking for the right
+# tool profile.
+#
+# lint and type_check only read the code, which is why neither is `risky`: a
+# check the model has to ask permission for is a check it stops running, and
+# the point of having them is that they are cheap enough to run after every
+# edit. write_tests writes the one file it is given, so it is gated like any
+# other write.
+
+
+def _python_tool_command(root: Path, module: str) -> str:
+    """Work out how to run a Python developer tool for this workspace.
+
+    The workspace's own virtualenv comes first, since it is the environment the
+    code was written against; then a binary on PATH (how ruff and mypy are
+    usually installed); then the interpreter the harness itself runs on. A
+    venv's console script is invoked as `python -m <module>` rather than
+    directly: the script carries an absolute shebang that stops working the
+    moment the virtualenv is copied or moved, while the module entry point
+    does not. Returns "" when the tool is nowhere to be found.
+    """
+    venv = root / ".venv" / "bin"
+    if (venv / module).exists() and (venv / "python").exists():
+        return f"{shlex.quote(str(venv / 'python'))} -m {module}"
+    found = shutil.which(module)
+    if found:
+        return shlex.quote(found)
+    try:
+        if importlib.util.find_spec(module) is not None:
+            return f"{shlex.quote(sys.executable)} -m {module}"
+    except (ImportError, ValueError):
+        pass
+    return ""
+
+
+def _require_python_tool(root: Path, module: str) -> str:
+    command = _python_tool_command(root, module)
+    if not command:
+        raise NotFoundError(
+            f"{module} is not installed anywhere this workspace can reach "
+            "(looked in .venv/bin, on PATH, and in the harness environment). "
+            "Check the code another way -- read it, or run its tests -- and say "
+            f"in your answer that {module} was unavailable."
+        )
+    return command
+
+
+def _check_target(registry: "ToolRegistry", raw_path: object) -> str:
+    """Validate a path to check and return it repo-relative, shell-quoted.
+
+    Relative is what gets passed on: a checker prints back the paths it was
+    given, and absolute ones would fill the model's context with the same
+    workspace prefix on every line.
+    """
+    path = registry._path(raw_path if raw_path not in (None, "") else ".")
+    if not path.exists():
+        raise NotFoundError(f"path not found: {raw_path}")
+    return shlex.quote(str(path.relative_to(registry.root)) or ".")
+
+
+def _checker_timeout(args: Dict, default: int = 120) -> int:
+    timeout = int(args.get("timeout", default))
+    if timeout < 1 or timeout > 600:
+        raise ArgError(f"timeout must be in [1, 600], got {timeout}")
+    return timeout
+
+
+@agent_tool(
+    name="type_check",
+    description=(
+        "Type-check Python code with mypy and report what it found. "
+        "Run it after writing or changing a .py file; it only reads the code."
+    ),
+    schema={
+        "path": "str='.'|File or directory to check, relative to the repo root",
+        "timeout": "int=120|Timeout in seconds, between 1 and 600",
+    },
+    example='arguments: {"path": "calc.py"}',
+    profile="minimal",
+    language="python",
+    volatile=True,
+)
+def type_check_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
+    target = _check_target(registry, args.get("path", "."))
+    timeout = _checker_timeout(args)
+    mypy = _require_python_tool(registry.root, "mypy")
+    # Two flags earn their place on freshly written code. Missing third-party
+    # stubs are the loudest thing mypy says about a small project and none of
+    # it is about what the model just wrote, so they are ignored. And a model
+    # writing plain Python annotates nothing, which by default means mypy skips
+    # those function bodies entirely and reports success without having looked
+    # inside them -- a worse answer than a slow one, so bodies are checked.
+    # The cache lives with the rest of the harness state rather than in the
+    # project tree, and it earns its keep: without it every call re-reads the
+    # stdlib stubs, which is seconds the model spends per check.
+    cache = registry.root / STATE_DIR_NAME / "mypy_cache"
+    command = (
+        f"{mypy} --no-color-output --ignore-missing-imports --check-untyped-defs "
+        f"--cache-dir {shlex.quote(str(cache))} {target}"
+    )
+
+    def execute() -> str:
+        exit_code, body = _run_command(registry, command, timeout)
+        verdict = (
+            "no type errors"
+            if exit_code == 0
+            else "mypy reported type errors; fix them and run type_check again"
+        )
+        return f"$ {command}\n{body}\n{verdict}"
+
+    return execute
+
+
+@agent_tool(
+    name="lint",
+    description=(
+        "Lint Python code with ruff and report what it found. "
+        "Run it after writing or changing a .py file; it only reads the code."
+    ),
+    schema={
+        "path": "str='.'|File or directory to lint, relative to the repo root",
+        "timeout": "int=120|Timeout in seconds, between 1 and 600",
+    },
+    example='arguments: {"path": "calc.py"}',
+    profile="minimal",
+    language="python",
+    volatile=True,
+)
+def lint_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
+    target = _check_target(registry, args.get("path", "."))
+    timeout = _checker_timeout(args)
+    ruff = _require_python_tool(registry.root, "ruff")
+    # `concise` is one finding per line, which is what a small model can read
+    # and act on; the default output spends several lines and a code frame on
+    # each. Ruff is fast enough that skipping its cache costs nothing and
+    # keeps the check from writing anything into the workspace.
+    command = f"{ruff} check --no-cache {target}"
+
+    def execute() -> str:
+        exit_code, body = _run_command(registry, command, timeout)
+        verdict = (
+            "no lint issues"
+            if exit_code == 0
+            else "ruff reported issues; fix them and run lint again"
+        )
+        return f"$ {command}\n{body}\n{verdict}"
+
+    return execute
+
+
+def _default_test_path(root: Path, module: Path) -> Path:
+    """Where tests for `module` belong: the project's tests/ if it has one."""
+    name = f"test_{module.stem}.py"
+    if (root / "tests").is_dir():
+        return root / "tests" / name
+    return module.parent / name
+
+
+@agent_tool(
+    name="write_tests",
+    description=(
+        "Write a pytest file for a Python module and run it immediately, so "
+        "the tests and their result arrive in one step. Use it to prove the "
+        "code you wrote does what you say; re-run the tests later with run_tests."
+    ),
+    schema={
+        "path": "str|Module the tests cover, relative to the repo root",
+        "content": "str|Full pytest source: the imports plus test_* functions",
+        "test_path": "str=|Where to write the tests (default: tests/test_<module>.py)",
+        "timeout": "int=120|Timeout in seconds, between 1 and 600",
+    },
+    risky=True,
+    example=(
+        'arguments: {"path": "calc.py", "content": "from calc import add\\n\\n\\n'
+        'def test_add():\\n    assert add(1, 2) == 3\\n"}'
+    ),
+    profile="minimal",
+    language="python",
+    volatile=True,
+)
+def write_tests_tool(args: Dict, registry: "ToolRegistry") -> Callable[[], str]:
+    module = registry._existing_file(args.get("path"))
+    if module.suffix != ".py":
+        raise ArgError(
+            f"write_tests covers Python modules; {module.relative_to(registry.root)} "
+            "is not a .py file"
+        )
+    if "content" not in args:
+        raise ArgError("missing content: write_tests needs the test source to write")
+
+    content, notes = normalize_content(str(args["content"]), ".py")
+    if not content.strip():
+        raise ArgError("content must not be empty")
+    # Tests that pytest will not collect look like a passing run with nothing
+    # in it, which is the one outcome worse than a failure: the model reads it
+    # as proof the code works.
+    if "def test" not in content:
+        raise ArgError(
+            "no test functions found in content; pytest only collects functions "
+            "named test_* (for example 'def test_add():')"
+        )
+
+    raw_test_path = str(args.get("test_path", "")).strip()
+    test_path = (
+        registry._write_path(raw_test_path)
+        if raw_test_path
+        else _default_test_path(registry.root, module)
+    )
+    registry._guard_write_target(test_path)
+    if test_path == module:
+        raise ArgError(
+            f"test_path is the module under test ({module.relative_to(registry.root)}); "
+            "tests belong in a file of their own"
+        )
+    if test_path.is_dir():
+        raise ArgError(f"{test_path.relative_to(registry.root)} is a directory")
+    if not (test_path.name.startswith("test_") or test_path.name.endswith("_test.py")):
+        raise ArgError(
+            f"pytest will not collect {test_path.name}; name the file test_*.py "
+            "or *_test.py"
+        )
+
+    existing = (
+        test_path.read_text(encoding="utf-8", errors="replace")
+        if test_path.is_file()
+        else None
+    )
+    if existing is not None and existing.strip() and existing != content:
+        registry._require_seen(test_path, len(existing.splitlines()))
+
+    timeout = _checker_timeout(args)
+    python = _project_python(registry.root)
+    relative = test_path.relative_to(registry.root)
+    # `python -m pytest` rather than the pytest script: it puts the repo root
+    # on sys.path, which is what lets tests/test_calc.py import calc from a
+    # project that has no packaging of its own.
+    command = f"{shlex.quote(python)} -m pytest -q {shlex.quote(str(relative))}"
+
+    def execute() -> str:
+        backup = registry._backup(test_path)
+        test_path.parent.mkdir(parents=True, exist_ok=True)
+        test_path.write_text(content, encoding="utf-8")
+        parts = [
+            f"wrote {relative} ({len(content.splitlines())} lines, {len(content)} chars)"
+        ]
+        check = validate_syntax(test_path.name, content)
+        if check:
+            parts.append(check)
+        if backup:
+            parts.append(f"previous version saved to {backup}")
+        parts.extend(notes)
+
+        exit_code, body = _run_command(registry, command, timeout)
+        if exit_code == 0:
+            verdict = f"tests passed: {module.relative_to(registry.root)} does what these tests say"
+        elif "No module named pytest" in body:
+            # Otherwise this reads as a failing test and the model starts
+            # rewriting code that was never run.
+            verdict = (
+                "the tests did not run: pytest is not installed in this "
+                "workspace's environment, so this says nothing about the code."
+            )
+        elif exit_code == 5:
+            # pytest's "collected nothing", which is not a pass however green
+            # its output looks.
+            verdict = (
+                f"no tests ran: pytest collected nothing from {relative}. "
+                "Test functions must be named test_*."
+            )
+        else:
+            verdict = (
+                "tests failed; fix the code (or the test, if the test is wrong) "
+                "and run them again"
+            )
+        return "\n".join(parts + [f"$ {command}", body, verdict])
+
+    return execute
+
+
 # --- Core Tool Registry ---
 
 
@@ -1033,6 +1360,7 @@ class ToolRegistry:
         profile: str = "standard",
         max_noisy_output: int = DEFAULT_MAX_NOISY_OUTPUT,
         require_read_before_overwrite: bool = True,
+        language: str | None = None,
     ) -> None:
         self.workspace = workspace
         self.root = root
@@ -1047,6 +1375,11 @@ class ToolRegistry:
         self.profile = profile if profile in TOOL_PROFILES else "standard"
         self.max_noisy_output = max_noisy_output
         self.require_read_before_overwrite = require_read_before_overwrite
+        # The language named by --language, or None. Tools declared for a
+        # language appear only when it matches (see _build); resolving the key
+        # here means an alias or a stray capital does not silently hide them.
+        pack = resolve_language(language)
+        self.language = pack.key if pack else None
         self._registry: Tools = self._build()
 
     def items(self):
@@ -1168,7 +1501,9 @@ class ToolRegistry:
                 continue
         return coerced
 
-    def normalize_args(self, tool: ToolDescriptionEntry, args: Dict) -> tuple[Dict, List[str]]:
+    def normalize_args(
+        self, tool: ToolDescriptionEntry, args: Dict
+    ) -> tuple[Dict, List[str]]:
         """Repair the shape of a tool call before validating it.
 
         Unwraps argument envelopes, renames known aliases onto the fields this
@@ -1198,9 +1533,7 @@ class ToolRegistry:
     def run(self, name: str, args: Dict) -> str:
         """Resolve, repair, validate, approve and execute one tool call."""
         result, outcome = self._run(name, args or {})
-        self.logger.log(
-            "tool_outcome", name=name, outcome=outcome, chars=len(result)
-        )
+        self.logger.log("tool_outcome", name=name, outcome=outcome, chars=len(result))
         return result
 
     def _run(self, name: str, args: Dict) -> tuple[str, str]:
@@ -1221,7 +1554,9 @@ class ToolRegistry:
                 "tool_args_normalized", name=resolved, notes=arg_notes, args=args
             )
 
-        prefix = "\n".join(filter(None, [note, *(f"note: {item}" for item in arg_notes)]))
+        prefix = "\n".join(
+            filter(None, [note, *(f"note: {item}" for item in arg_notes)])
+        )
         prefix = prefix + "\n" if prefix else ""
 
         repeat = self._repeated_call(resolved, args)
@@ -1302,6 +1637,8 @@ class ToolRegistry:
         allowed = TOOL_PROFILES[: TOOL_PROFILES.index(self.profile) + 1]
         for name, definition in _TOOL_CATALOG.items():
             if definition["profile"] not in allowed:
+                continue
+            if definition["language"] and definition["language"] != self.language:
                 continue
             if name == "delegate" and self.delegate_fn is None:
                 continue

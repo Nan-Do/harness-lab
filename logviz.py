@@ -399,6 +399,8 @@ def render_session_start(d, w, full):
         f"read_only={d.get('read_only')} resumed={d.get('resumed')} "
         f"history_len={d.get('history_len')}"
     )
+    if d.get("language"):
+        hdr += f" language={d.get('language')}"
     return hdr, []
 
 

@@ -331,6 +331,11 @@ class MiniAgentApp(App):
                     (f"endpoint   {self.endpoint}\n", ""),
                     (f"approval   {self.agent.approval_policy}\n", ""),
                     (f"steps      {self._step_budget()}\n", ""),
+                    *(
+                        [(f"language   {self.agent.language.label}\n", "")]
+                        if self.agent.language
+                        else []
+                    ),
                     ("\nType a request and press Enter. /help lists commands.", "dim"),
                 ),
                 border_style="cyan",

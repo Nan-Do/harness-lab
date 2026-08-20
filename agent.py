@@ -8,6 +8,7 @@ from model_clients import LlamaCppModelClient
 from session import SessionStore
 from tools import READ_TOOLS, WRITE_TOOLS, ToolRegistry
 from typing import Callable, Dict, List, Self
+from languages import resolve_language
 from workspace import WorkspaceContext
 from app_types import (
     ContextUsage,
@@ -63,6 +64,7 @@ class MiniAgent:
         max_noisy_output: int = DEFAULT_MAX_NOISY_OUTPUT,
         require_read_before_overwrite: bool = True,
         add_planning: bool = False,
+        language: str | None = None,
     ) -> None:
         self.model_client = model_client
         self.workspace = workspace
@@ -89,6 +91,10 @@ class MiniAgent:
         self.max_noisy_output = max_noisy_output
         self.require_read_before_overwrite = require_read_before_overwrite
         self.add_planning = add_planning
+        # The language pack named by --language (languages.py), or None. It
+        # decides both the rules in the system prompt and which verification
+        # tools the registry exposes.
+        self.language = resolve_language(language)
         self.session = session or Session(
             id=datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
             created_at=now(),
@@ -105,6 +111,10 @@ class MiniAgent:
             read_only=self.read_only,
             resumed=session is not None,
             history_len=len(self.session.history),
+            # Which knobs a run was started with is what makes two logs
+            # comparable, and the language changes both the prompt and the
+            # tool set.
+            language=self.language.key if self.language else None,
         )
 
         self.tools = ToolRegistry(
@@ -121,6 +131,7 @@ class MiniAgent:
             profile=self.tool_profile,
             max_noisy_output=self.max_noisy_output,
             require_read_before_overwrite=self.require_read_before_overwrite,
+            language=self.language.key if self.language else None,
         )
         self.prefix = self.build_prefix()
 
@@ -202,6 +213,7 @@ class MiniAgent:
             tool_profile=self.tool_profile,
             max_noisy_output=self.max_noisy_output,
             require_read_before_overwrite=self.require_read_before_overwrite,
+            language=self.language.key if self.language else None,
         )
         child.session.memory.task = task
         child.session.memory.notes = [self.history_text()]
@@ -243,12 +255,20 @@ class MiniAgent:
         )
 
         return "\n\n".join(
-            [
-                "You are Harness Lab, a small local coding agent running through llama-server.",
-                planning,
-                "Rules:\n" + rules,
-                self.workspace.text(),
-            ]
+            filter(
+                None,
+                [
+                    "You are Harness Lab, a small local coding agent running through llama-server.",
+                    planning,
+                    "Rules:\n" + rules,
+                    # The language pack goes after the general rules and before
+                    # the workspace facts: it is a rule about how to work, not a
+                    # fact about the repo, and the tools it names only exist
+                    # when it does.
+                    self.language.prompt_section() if self.language else "",
+                    self.workspace.text(),
+                ],
+            )
         )
 
     def memory_text(self: Self) -> str:
