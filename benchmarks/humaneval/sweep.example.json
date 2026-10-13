@@ -1,0 +1,27 @@
+{
+  "runs": [
+    {
+      "label": "qwen3.5-4b",
+      "host": "127.0.0.1",
+      "port": "8080",
+      "tools": "standard",
+      "max_steps": 10
+    },
+    {
+      "label": "qwen3.5-4b +language",
+      "host": "127.0.0.1",
+      "port": "8080",
+      "tools": "standard",
+      "max_steps": 14,
+      "language": "python"
+    },
+    {
+      "label": "gemma-4-12b",
+      "host": "127.0.0.1",
+      "port": "8081",
+      "tools": "standard",
+      "max_steps": 10,
+      "harness_args": ["--no-stream"]
+    }
+  ]
+}
