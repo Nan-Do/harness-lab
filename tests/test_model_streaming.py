@@ -12,7 +12,12 @@ from types import SimpleNamespace
 from typing import List
 
 from agent_logging import AgentLogger
-from model_clients import LlamaCppModelClient, ThinkSplitter, fold
+from model_clients import (
+    MAX_CONTINUATION_ROUNDS,
+    LlamaCppModelClient,
+    ThinkSplitter,
+    fold,
+)
 
 
 def client(stream: bool = True) -> LlamaCppModelClient:
@@ -203,6 +208,65 @@ def test_streamed_answer_continues_past_the_token_limit():
     assert seen == ["first half", " and second"]
     assert response.content == "first half and second"
     assert rounds == []
+
+
+def test_a_second_continuation_round_replaces_the_prefill_instead_of_stacking():
+    """Two rounds must leave one assistant turn at the end, not two.
+
+    llama-server reads a trailing assistant message as a prefill to continue
+    and rejects a conversation that ends in two of them, so stacking a fresh
+    partial answer onto the previous round's list turned any answer long
+    enough to need two continuations into a 400 for the whole request.
+    """
+    model = client()
+    rounds = [
+        [chunk("one ", finish_reason="length")],
+        [chunk("two ", finish_reason="length")],
+        [chunk("three", finish_reason="stop")],
+    ]
+    sent: List[list] = []
+
+    def create(messages, tools, max_new_tokens, stream):
+        sent.append(list(messages))
+        return iter(rounds.pop(0))
+
+    model._LlamaCppModelClient__create = create
+    conversation = [
+        {"role": "system", "content": "rules"},
+        {"role": "user", "content": "write it out"},
+    ]
+
+    response = model.complete(conversation, 128)
+
+    assert response.content == "one two three"
+    assert [message["role"] for message in sent[0]] == ["system", "user"]
+    for round_messages in sent[1:]:
+        roles = [message["role"] for message in round_messages]
+        assert roles == ["system", "user", "assistant"]
+    # The prefill carries everything written so far, not just the last piece.
+    assert sent[1][-1]["content"] == "one "
+    assert sent[2][-1]["content"] == "one two "
+    # And the caller's own list is never mutated.
+    assert len(conversation) == 2
+
+
+def test_a_backend_that_never_continues_is_given_up_on():
+    """A prefill the backend ignores looks identical every round, forever."""
+    model = client()
+    rounds = 0
+
+    def create(messages, tools, max_new_tokens, stream):
+        nonlocal rounds
+        rounds += 1
+        return iter([chunk("same text again", finish_reason="length")])
+
+    model._LlamaCppModelClient__create = create
+
+    response = model.complete([{"role": "user", "content": "go"}], 128)
+
+    # Bounded, and what the model did manage to write is still returned.
+    assert rounds == MAX_CONTINUATION_ROUNDS + 1
+    assert response.content.startswith("same text again")
 
 
 def test_streamed_reasoning_field_goes_to_its_own_channel():

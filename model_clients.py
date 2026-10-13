@@ -143,6 +143,17 @@ class Turn:
     reasoning: str = ""
 
 
+# A continuation round re-sends the conversation with the partial answer as a
+# trailing assistant message and asks the model to carry on from it. Not every
+# backend honours that: some ignore the prefill and generate the same text
+# again, which without a cap is an unbounded loop -- every round looks exactly
+# like the one before it, so nothing about the response ever ends it. Four
+# rounds is room for a genuinely long answer at any sane --max-new-tokens, and
+# a short enough leash that a backend which is not continuing at all costs a
+# step rather than the whole run.
+MAX_CONTINUATION_ROUNDS = 4
+
+
 class LlamaCppModelClient:
     def __check_model(self: Self):
         try:
@@ -408,6 +419,14 @@ class LlamaCppModelClient:
         # Shared across continuation rounds so a `<think>` block cut off at the
         # token limit is still read as reasoning when generation resumes.
         splitter = ThinkSplitter()
+        # The conversation as the caller built it. Every continuation round
+        # re-sends *this* with the partial answer appended as a single
+        # assistant prefill: appending to the previous round's list instead
+        # leaves two assistant turns at the end of the conversation, which
+        # llama-server refuses outright ("Cannot have 2 or more assistant
+        # messages at the end of the list") -- so a turn that needed two
+        # continuations used to end the whole request in a 400.
+        base_messages = list(messages)
         while has_more_data:
             if self.stream:
                 turn = self.__complete_streamed(
@@ -452,13 +471,16 @@ class LlamaCppModelClient:
             # so a long think block is resumed rather than dropped as empty.
             if (
                 finish_reason == "length"
+                and round_index <= MAX_CONTINUATION_ROUNDS
                 and not tool_calls
                 and not malformed_tool_calls
                 and (chunk or turn.reasoning)
             ):
                 # The model resumes from its own partial output; when that is
                 # all reasoning so far, the reasoning is what it needs back.
-                messages = messages + [
+                # `assistant_message` is cumulative, so one prefill carries
+                # everything written across every round so far.
+                messages = base_messages + [
                     {
                         "role": "assistant",
                         "content": assistant_message or reasoning_message,
@@ -471,6 +493,21 @@ class LlamaCppModelClient:
                     messages=messages,
                 )
             else:
+                if finish_reason == "length":
+                    # Worth its own line in the log: an answer that stops here
+                    # is cut off, and whether it was the round cap or an empty
+                    # turn that ended it is the difference between "the model
+                    # writes long" and "the backend is not continuing at all".
+                    self.logger.log(
+                        "llm_continuation_stopped",
+                        round=round_index,
+                        max_rounds=MAX_CONTINUATION_ROUNDS,
+                        reason=(
+                            "round cap"
+                            if round_index > MAX_CONTINUATION_ROUNDS
+                            else "nothing generated to continue from"
+                        ),
+                    )
                 # A tool call cut off at the token limit produces unparseable
                 # arguments; flag it so the agent can give targeted feedback
                 # instead of a generic "invalid JSON" notice.

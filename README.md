@@ -31,6 +31,7 @@ diff the two runs to see what the change actually did.
 | `tui.py` | Textual-based interactive front-end |
 | `plain.py` | Plain-text front-end: the whole interaction as text on stdout |
 | `utils.py` | Shared constants and helpers: context budgets, tool profiles, ignored paths, formatting |
+| `benchmarks/humaneval/` | HumanEval scored through the harness, and a sweep runner to compare models or knobs ([README](benchmarks/humaneval/README.md)) |
 
 &nbsp;
 
@@ -448,6 +449,14 @@ the token limit is continued exactly as before (the continuation streams
 too). Running the same prompt with and without `--stream` should produce the
 same `tool_call` and `final` events.
 
+A continuation re-sends the conversation with the partial answer as a trailing
+assistant message for the model to carry on from, and not every backend
+honours that — some ignore it and generate the same text again. Since every
+such round looks exactly like the one before it, nothing about the response
+would ever end the loop, so continuation is capped at four rounds
+(`model_clients.MAX_CONTINUATION_ROUNDS`) and the stop is logged as
+`llm_continuation_stopped`, naming which of the two ended it.
+
 Use `--no-stream` to go back to one-shot completions — worth trying if a
 backend's streamed tool calls arrive malformed, since it isolates whether a
 failure comes from generation or from stream reassembly.
@@ -781,10 +790,11 @@ and exchanges, in order:
 - `history_append` — each message or tool entry added to the transcript
 - `prompt_built` — the message roles and character counts sent to the model
   for that step
-- `llm_request` / `llm_response` / `llm_continuation` — the raw messages,
-  model params, and completions exchanged with the `llama-server` backend,
-  including whether the round was streamed and the `reasoning` the model
-  produced for it
+- `llm_request` / `llm_response` / `llm_continuation` /
+  `llm_continuation_stopped` — the raw messages, model params, and completions
+  exchanged with the `llama-server` backend, including whether the round was
+  streamed, the `reasoning` the model produced for it, and why a turn cut off
+  at the token limit stopped being continued
 - `tool_call` / `tool_result` — tool invocations and their output
 - `tool_outcome` — how each call ended (`ok`, `arg_error`, `not_found`,
   `no_match`, `denied`, `guard_blocked`, `repeated`, `unknown_tool`), which
@@ -865,6 +875,24 @@ Since every run is fully logged, a natural workflow is: change one of the
 above, rerun the same prompt against the same workspace, and diff the two
 JSONL logs (or compare `final` events, tool-call counts, and `retry` /
 `malformed_tool_call` events) to see the effect.
+
+&nbsp;
+
+## Benchmarks
+
+Diffing two runs of one prompt tells you what changed; it does not tell you
+whether the change was an improvement. [`benchmarks/humaneval/`](benchmarks/humaneval/README.md)
+is the systematic version: the 164 HumanEval problems, each in its own
+workspace, each solved by the agent through its ordinary tools, scored on the
+file it left behind.
+
+```bash
+# check the scorer itself first -- no model involved, must print 164/164
+uv run python benchmarks/humaneval/run_benchmark.py --self-test
+
+# then score whatever llama-server is serving
+uv run python benchmarks/humaneval/run_benchmark.py --port 8080
+```
 
 &nbsp;
 

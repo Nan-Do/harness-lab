@@ -36,3 +36,7 @@ tmp/
 
 # Coding scenarios
 tests/scenarios/
+
+# Benchmark dataset cache and run output (results, workspaces, per-problem logs)
+benchmarks/*/data/
+benchmarks/*/runs/
